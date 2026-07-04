@@ -6,7 +6,7 @@
 YORO is an OpenAI-compatible caching proxy for LLM applications. Unlike a plain
 semantic cache, it tracks what each cached answer depends on and invalidates
 entries when those dependencies change, so it never serves an answer whose
-premises moved. The engine can also re-apply the cached reasoning to new inputs
+premises moved. The engine can also re-apply the cached derivation to new inputs
 (*replay*) instead of re-deriving from scratch — available in the library today,
 wired into the proxy in the next release.
 
@@ -17,14 +17,14 @@ Website: [yorocache.com](https://yorocache.com)
 Semantic caches (GPTCache and similar) serve a cached answer whenever a new request
 is embedding-similar to a previous one. This saves tokens, but it has a failure mode
 that standard cache metrics do not surface: when the world changes, the cache keeps
-serving the old answer. In our measurements, a drift rate of just 5% (5% of recurring
+serving the old answer. In my measurements, a drift rate of just 5% (5% of recurring
 tasks whose true answer has changed) already makes over half of a naive cache's hits
 wrong, because popular items drift too and every later hit serves the dead answer.
 
 Adding invalidation alone is not sufficient. In agent workloads, the *method* behind
 an answer often lives in earlier interactions rather than in the current request. An
 invalidating cache correctly drops the stale entry, then re-derives without the
-method, caches the wrong result, and serves it — a failure mode we call
+method, caches the wrong result, and serves it — a failure mode I call
 *re-poisoning*. YORO addresses both failure modes: dependency fingerprints handle
 detection, and replay of the stored reasoning handles re-derivation.
 
@@ -32,7 +32,7 @@ detection, and replay of the stored reasoning handles re-derivation.
 
 ```bash
 pip install "yoro-cache[embed]"
-# before the first PyPI release:
+# or install the latest from main:
 pip install "yoro-cache[embed] @ git+https://github.com/ChaitanyaPinapaka/yoro-cache"
 ```
 
@@ -58,7 +58,7 @@ export OPENAI_BASE_URL=http://127.0.0.1:8400/v1
 ```
 
 On this setup, a repeated ask serves from cache in ~12 ms against ~3.3 s upstream,
-with the cached reasoning trace preserved in the response.
+with the cached derivation preserved in the response.
 
 To use YORO under [OpenCode](https://opencode.ai), register the proxy as a custom
 provider in `opencode.json`:
@@ -121,7 +121,8 @@ cheapest tier that is safe:
 1. **Serve** — the matched entry is fresh and similarity is high: return the cached
    answer with no model call.
 2. **Replay** — same entry, but its dependencies changed: inject the stored
-   reasoning trace and apply it to the new inputs. Short output; no re-exploration.
+   derivation (the model's visible working, or a structured plan where none is
+   exposed) and apply it to the new inputs. Short output; no re-exploration.
    (Library + benchmark today; proxy integration lands in the next release.)
 3. **Reason** — novel or borderline request: full reasoning upstream; the trace,
    answer, and dependency fingerprints are cached.
