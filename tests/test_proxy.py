@@ -71,14 +71,14 @@ def test_proxycache_hit_miss():
         Matcher(0.95, 0.6, True),
         Invalidator(use_deps=True, use_ttl=False, use_reliability=False),
     )
-    d, _, _ = pc.lookup("sum of integers 1 to 100", {})
+    d, _, _, _ = pc.lookup("sum of integers 1 to 100", {})
     assert d == Decision.MISS  # empty cache
     pc.store("sum of integers 1 to 100", "5050", None, {})
-    d, case, sim = pc.lookup("sum of integers 1 to 100", {})
+    d, case, sim, _ = pc.lookup("sum of integers 1 to 100", {})
     assert (
         d == Decision.HIT and case.outcome == "5050" and sim > 0.99
     )  # exact recurrence
-    d2, _, _ = pc.lookup("capital city of france please", {})
+    d2, _, _, _ = pc.lookup("capital city of france please", {})
     assert d2 != Decision.HIT  # unrelated -> not a hit
     assert pc.stats.stored == 1
 
@@ -103,6 +103,79 @@ def test_synth_completion():
     assert c["choices"][0]["message"]["reasoning_content"] == "because"
 
 
+def _mk():
+    return ProxyCache(
+        HashEmbedder(),
+        ReasoningCache(),
+        Matcher(0.95, 0.6, True),
+        Invalidator(use_deps=True, use_ttl=False, use_reliability=False),
+    )
+
+
+def test_proxycache_thread_safety():
+    """8 threads interleaving store+lookup: no exceptions, no lost updates. Guards the
+    ThreadingHTTPServer usage (shared case store + stats + matrix rebuild)."""
+    import threading
+
+    pc = _mk()
+    errs = []
+
+    def worker(i):
+        try:
+            for j in range(30):
+                key = f"task {i} {j} tok{i * 100 + j} uniq{i}-{j}"
+                pc.store(key, f"ans-{i}-{j}", None, {})
+                d, case, sim, _ = pc.lookup(key, {})
+                assert case is not None
+        except Exception as e:  # pragma: no cover - failure path
+            errs.append(e)
+
+    ts = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not errs, errs
+    assert pc.stats.stored == 240  # no lost increments under the lock
+
+
+def test_store_reuses_lookup_embedding():
+    """The miss path must not re-encode: store(emb=...) skips the embedder."""
+
+    class CountingEmbedder(HashEmbedder):
+        calls = 0
+
+        def embed(self, text):
+            CountingEmbedder.calls += 1
+            return super().embed(text)
+
+    pc = ProxyCache(
+        CountingEmbedder(),
+        ReasoningCache(),
+        Matcher(0.95, 0.6, True),
+        Invalidator(use_deps=True, use_ttl=False, use_reliability=False),
+    )
+    d, _, _, emb = pc.lookup("what is six factorial", {})
+    pc.store("what is six factorial", "720", None, {}, emb=emb)
+    assert CountingEmbedder.calls == 1  # one encode for lookup+store together
+
+
+def test_atomic_save_roundtrip(tmp_path):
+    """save() writes via tmp+rename; the file is always complete, valid JSON."""
+    import json as _json
+
+    p = str(tmp_path / "cache.json")
+    rc = ReasoningCache(p)
+    e = HashEmbedder(32)
+    rc.add("t1", e.embed("alpha beta"), "r", "o1", {})
+    rc.save()
+    rc.add("t2", e.embed("gamma delta"), "r", "o2", {})
+    rc.save()
+    data = _json.load(open(p))
+    assert len(data) == 2 and not (tmp_path / "cache.json.tmp").exists()
+    rc2 = ReasoningCache(p).load()
+    case, sim = rc2.nearest(e.embed("alpha beta"))
+    assert case.outcome == "o1" and sim > 0.99
+
+
 if __name__ == "__main__":
     tests = [
         test_extract_task,
@@ -111,6 +184,8 @@ if __name__ == "__main__":
         test_proxycache_hit_miss,
         test_proxycache_dep_invalidation,
         test_synth_completion,
+        test_proxycache_thread_safety,
+        test_store_reuses_lookup_embedding,
     ]
     for fn in tests:
         fn()

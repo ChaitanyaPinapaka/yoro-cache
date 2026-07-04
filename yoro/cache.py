@@ -56,6 +56,7 @@ class ReasoningCache:
     def __init__(self, path: Optional[str] = None):
         self.cases: list[ReasoningCase] = []
         self.path = path
+        self._E = None  # cached embedding matrix; rebuilt lazily after any write
 
     # ---- writes ----
     def add(
@@ -71,6 +72,7 @@ class ReasoningCache:
             ttl=ttl,
         )
         self.cases.append(c)
+        self._E = None
         return c
 
     def update(
@@ -88,6 +90,7 @@ class ReasoningCache:
         c.version += 1
         c.updated_at = time.time()
         c.uses = c.successes = c.failures = 0
+        self._E = None
         return c
 
     def record_use(self, case: ReasoningCase, success: bool) -> None:
@@ -102,8 +105,9 @@ class ReasoningCache:
         if not self.cases:
             return None, -1.0
         q = np.asarray(embedding, dtype=np.float32)
-        E = np.stack([c.embedding for c in self.cases])
-        sims = E @ q
+        if self._E is None or self._E.shape[0] != len(self.cases):
+            self._E = np.stack([c.embedding for c in self.cases])
+        sims = self._E @ q
         i = int(np.argmax(sims))
         return self.cases[i], float(sims[i])
 
@@ -119,14 +123,17 @@ class ReasoningCache:
         if not p:
             return
         os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
-        with open(p, "w") as f:
+        tmp = p + ".tmp"  # atomic: a concurrent reader/crash never sees a torn file
+        with open(tmp, "w") as f:
             json.dump([c.to_dict() for c in self.cases], f, indent=2)
+        os.replace(tmp, p)
 
     def load(self, path: Optional[str] = None) -> "ReasoningCache":
         p = path or self.path
         if p and os.path.exists(p):
             with open(p) as f:
                 self.cases = [ReasoningCase.from_dict(d) for d in json.load(f)]
+            self._E = None
         return self
 
     def __len__(self) -> int:

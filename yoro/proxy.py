@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -223,7 +224,12 @@ class Stats:
 
 class ProxyCache:
     """Wraps the YORO cache with the proxy's lookup/store decisions. Embedder is injected
-    so tests can use a cheap one."""
+    so tests can use a cheap one.
+
+    Thread safety: ThreadingHTTPServer serves each request on its own thread, so the
+    case store, stats, and disk writes are guarded by one lock, and the embedder by
+    another (torch encoders are not guaranteed re-entrant). Embedding happens outside
+    the store lock so a slow encode never blocks cache reads."""
 
     def __init__(
         self,
@@ -237,23 +243,42 @@ class ProxyCache:
         self.matcher = matcher
         self.invalidator = invalidator
         self.stats = Stats()
+        self._lock = threading.Lock()
+        self._embed_lock = threading.Lock()
+
+    def _embed(self, task: str):
+        with self._embed_lock:
+            return self.embedder.embed(task)
 
     def lookup(self, task: str, deps: dict):
-        """Returns (decision, case, sim). HIT means: replay case.outcome."""
-        emb = self.embedder.embed(task)
-        case, sim = self.cache.nearest(emb)
-        if case is None:
-            return Decision.MISS, None, -1.0
-        fresh = self.invalidator.is_fresh(case, deps)
-        return self.matcher.decide(sim, fresh), case, sim
+        """Returns (decision, case, sim, emb). HIT means: replay case.outcome.
+        The embedding is returned so a following store() never re-encodes."""
+        emb = self._embed(task)
+        with self._lock:
+            case, sim = self.cache.nearest(emb)
+            if case is None:
+                return Decision.MISS, None, -1.0, emb
+            fresh = self.invalidator.is_fresh(case, deps)
+            return self.matcher.decide(sim, fresh), case, sim, emb
 
     def store(
-        self, task: str, content: str, reasoning: Optional[str], deps: dict
+        self, task: str, content: str, reasoning: Optional[str], deps: dict, emb=None
     ) -> None:
-        emb = self.embedder.embed(task)
-        self.cache.add(task, emb, reasoning or content, content, deps)
-        self.stats.stored += 1
-        self.cache.save()
+        if emb is None:
+            emb = self._embed(task)
+        with self._lock:
+            self.cache.add(task, emb, reasoning or content, content, deps)
+            self.stats.stored += 1
+            self.cache.save()
+
+    def bump(self, field: str) -> None:
+        with self._lock:
+            setattr(self.stats, field, getattr(self.stats, field) + 1)
+
+    def record_hit(self, case) -> None:
+        with self._lock:
+            self.cache.record_use(case, True)
+            self.stats.hit += 1
 
 
 def build_proxy_cache(cfg: "Config") -> ProxyCache:
@@ -296,6 +321,8 @@ class Config:
 
 def make_handler(cfg: Config, pcache: ProxyCache):
     import requests
+
+    sess = requests.Session()  # connection pooling: no per-request TCP/TLS handshake
 
     def upstream_url(path: str) -> str:
         # incoming "/v1/chat/completions" -> upstream base (".../v1") + "/chat/completions"
@@ -341,7 +368,7 @@ def make_handler(cfg: Config, pcache: ProxyCache):
                     {"ok": True, "upstream": cfg.upstream, "policy": cfg.policy}
                 )
             try:
-                r = requests.get(
+                r = sess.get(
                     upstream_url(self.path), headers=self._auth(), timeout=60
                 )
                 return self._send_json(r.json(), r.status_code)
@@ -362,7 +389,7 @@ def make_handler(cfg: Config, pcache: ProxyCache):
 
         def _passthrough(self, raw: bytes):
             try:
-                r = requests.post(
+                r = sess.post(
                     upstream_url(self.path), headers=self._auth(), data=raw, timeout=600
                 )
                 self.send_response(r.status_code)
@@ -384,17 +411,16 @@ def make_handler(cfg: Config, pcache: ProxyCache):
 
             why = cacheable_reason(body, cache_hdr, cfg.policy)
             if why is not None:
-                pcache.stats.skip += 1
+                pcache.bump("skip")
                 self._note(f"SKIP:{why}", task)
                 return self._proxy_chat(
                     body, raw, store_task=None, deps=deps, tag=f"SKIP:{why}"
                 )
 
-            decision, case, sim = pcache.lookup(task, deps)
+            decision, case, sim, emb = pcache.lookup(task, deps)
             if decision == Decision.HIT and case is not None:
-                pcache.stats.hit += 1
                 self._note("HIT", task, sim)
-                pcache.cache.record_use(case, True)
+                pcache.record_hit(case)
                 created = time.time()
                 hdr = {"X-YORO-Cache": "HIT", "X-YORO-Sim": f"{sim:.3f}"}
                 reasoning = case.reasoning if case.reasoning != case.outcome else None
@@ -405,9 +431,11 @@ def make_handler(cfg: Config, pcache: ProxyCache):
                     synth_completion(model, case.outcome, reasoning, created), 200, hdr
                 )
 
-            pcache.stats.miss += 1
+            pcache.bump("miss")
             self._note("MISS", task, sim)
-            return self._proxy_chat(body, raw, store_task=task, deps=deps, tag="MISS")
+            return self._proxy_chat(
+                body, raw, store_task=task, deps=deps, tag="MISS", emb=emb
+            )
 
         # replay a cached answer as a one-shot SSE stream
         def _stream_cached(
@@ -446,12 +474,13 @@ def make_handler(cfg: Config, pcache: ProxyCache):
             store_task: Optional[str],
             deps: dict,
             tag: str,
+            emb=None,
         ):
             stream = bool(body.get("stream"))
             try:
                 if stream:
-                    return self._proxy_stream(raw, store_task, deps, tag)
-                r = requests.post(
+                    return self._proxy_stream(raw, store_task, deps, tag, emb)
+                r = sess.post(
                     upstream_url(self.path), headers=self._auth(), data=raw, timeout=600
                 )
                 obj = r.json()
@@ -460,16 +489,18 @@ def make_handler(cfg: Config, pcache: ProxyCache):
                     content = (msg.get("content") or "").strip()
                     reasoning = (msg.get("reasoning_content") or "").strip() or None
                     if content:
-                        pcache.store(store_task, content, reasoning, deps)
+                        pcache.store(store_task, content, reasoning, deps, emb=emb)
+                    else:  # e.g. a reasoning model exhausted max_tokens thinking
+                        self._note("MISS:not-stored(empty content)", store_task)
                 return self._send_json(obj, r.status_code, {"X-YORO-Cache": tag})
             except Exception as e:
                 return self._send_json({"error": str(e)}, 502)
 
         def _proxy_stream(
-            self, raw: bytes, store_task: Optional[str], deps: dict, tag: str
+            self, raw: bytes, store_task: Optional[str], deps: dict, tag: str, emb=None
         ):
             try:
-                r = requests.post(
+                r = sess.post(
                     upstream_url(self.path),
                     headers=self._auth(),
                     data=raw,
@@ -506,7 +537,7 @@ def make_handler(cfg: Config, pcache: ProxyCache):
             if store_task and buf:
                 content, reasoning = accumulate_sse(bytes(buf))
                 if content:
-                    pcache.store(store_task, content, reasoning, deps)
+                    pcache.store(store_task, content, reasoning, deps, emb=emb)
 
         def _note(self, tag: str, task: str, sim: float = -1.0):
             t = (task[:60] + "…") if len(task) > 60 else task
