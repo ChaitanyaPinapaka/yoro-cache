@@ -1,0 +1,1062 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>
+            YORO — You Only Reason Once. Cache the plan, not the answer.
+        </title>
+        <meta
+            name="description"
+            content="A drop-in LLM caching proxy that invalidates on change and replays cached reasoning instead of serving stale answers. With the benchmark receipts to prove it."
+        />
+        <style>
+            :root {
+                --surface-1: #fcfcfb;
+                --page: #f9f9f7;
+                --ink-1: #0b0b0b;
+                --ink-2: #52514e;
+                --ink-3: #898781;
+                --grid: #e1e0d9;
+                --baseline: #c3c2b7;
+                --ring: rgba(11, 11, 11, 0.1);
+                --s-replay: #2a78d6;
+                --s-replaylow: #1baf7a;
+                --s-serve: #eda100;
+                --s-gptcache: #e34948;
+                --s-nocache: #898781;
+                --t-outdated: #4a3aa7;
+                --t-repoison: #eb6834;
+                --code-bg: #f0efec;
+                --good: #006300;
+            }
+            @media (prefers-color-scheme: dark) {
+                :root {
+                    --surface-1: #1a1a19;
+                    --page: #0d0d0d;
+                    --ink-1: #ffffff;
+                    --ink-2: #c3c2b7;
+                    --ink-3: #898781;
+                    --grid: #2c2c2a;
+                    --baseline: #383835;
+                    --ring: rgba(255, 255, 255, 0.1);
+                    --s-replay: #3987e5;
+                    --s-replaylow: #199e70;
+                    --s-serve: #c98500;
+                    --s-gptcache: #e66767;
+                    --t-outdated: #9085e9;
+                    --t-repoison: #d95926;
+                    --code-bg: #262624;
+                    --good: #0ca30c;
+                }
+            }
+            * {
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+            }
+            body {
+                font-family:
+                    system-ui,
+                    -apple-system,
+                    "Segoe UI",
+                    sans-serif;
+                background: var(--page);
+                color: var(--ink-1);
+                line-height: 1.55;
+                -webkit-font-smoothing: antialiased;
+            }
+            .wrap {
+                max-width: 1060px;
+                margin: 0 auto;
+                padding: 0 24px;
+            }
+            a {
+                color: var(--s-replay);
+                text-decoration: none;
+            }
+            a:hover {
+                text-decoration: underline;
+            }
+            h1 {
+                font-size: clamp(1.9rem, 4.5vw, 3rem);
+                line-height: 1.12;
+                letter-spacing: -0.02em;
+            }
+            h2 {
+                font-size: clamp(1.35rem, 2.6vw, 1.8rem);
+                letter-spacing: -0.01em;
+                margin-bottom: 0.35em;
+            }
+            h3 {
+                font-size: 1.05rem;
+                margin-bottom: 0.3em;
+            }
+            p.lede {
+                font-size: 1.12rem;
+                color: var(--ink-2);
+                max-width: 46em;
+            }
+            section {
+                padding: 56px 0;
+                border-top: 1px solid var(--grid);
+            }
+            header.hero {
+                padding: 72px 0 56px;
+            }
+            .tag {
+                display: inline-block;
+                font-size: 0.78rem;
+                font-weight: 600;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+                color: var(--ink-3);
+                margin-bottom: 14px;
+            }
+            .hero .sub {
+                margin-top: 14px;
+                font-size: 1.18rem;
+                color: var(--ink-2);
+                max-width: 44em;
+            }
+            .cta {
+                margin-top: 26px;
+                display: flex;
+                gap: 12px;
+                flex-wrap: wrap;
+            }
+            .btn {
+                display: inline-block;
+                padding: 10px 18px;
+                border-radius: 8px;
+                font-weight: 600;
+                font-size: 0.95rem;
+                border: 1px solid var(--ring);
+            }
+            .btn.primary {
+                background: var(--s-replay);
+                color: #fff;
+            }
+            .btn.ghost {
+                color: var(--ink-1);
+                background: var(--surface-1);
+            }
+            .tiles {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 14px;
+                margin-top: 38px;
+            }
+            .tile {
+                background: var(--surface-1);
+                border: 1px solid var(--ring);
+                border-radius: 12px;
+                padding: 18px 18px 14px;
+            }
+            .tile .big {
+                font-size: 1.9rem;
+                font-weight: 700;
+                letter-spacing: -0.02em;
+            }
+            .tile .lbl {
+                font-size: 0.85rem;
+                color: var(--ink-2);
+                margin-top: 2px;
+            }
+            .tile .src {
+                font-size: 0.72rem;
+                color: var(--ink-3);
+                margin-top: 8px;
+            }
+            .fig {
+                background: var(--surface-1);
+                border: 1px solid var(--ring);
+                border-radius: 12px;
+                padding: 20px;
+                margin-top: 22px;
+            }
+            .fig h3 {
+                font-size: 1rem;
+            }
+            .fig .sub {
+                font-size: 0.85rem;
+                color: var(--ink-2);
+                margin-bottom: 6px;
+            }
+            .fig svg {
+                width: 100%;
+                height: auto;
+                display: block;
+            }
+            .fig details {
+                margin-top: 10px;
+                font-size: 0.85rem;
+            }
+            .fig details summary {
+                cursor: pointer;
+                color: var(--ink-3);
+            }
+            .fig table {
+                border-collapse: collapse;
+                margin-top: 8px;
+                font-variant-numeric: tabular-nums;
+                font-size: 0.83rem;
+            }
+            .fig td,
+            .fig th {
+                padding: 3px 12px 3px 0;
+                text-align: right;
+                border-bottom: 1px solid var(--grid);
+                color: var(--ink-2);
+            }
+            .fig th {
+                color: var(--ink-3);
+                font-weight: 600;
+            }
+            .fig td:first-child,
+            .fig th:first-child {
+                text-align: left;
+            }
+            .legend {
+                display: flex;
+                gap: 16px;
+                flex-wrap: wrap;
+                font-size: 0.83rem;
+                color: var(--ink-2);
+                margin: 8px 0 2px;
+            }
+            .legend .key {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+            }
+            .key .swatch {
+                width: 14px;
+                height: 3px;
+                border-radius: 2px;
+                display: inline-block;
+            }
+            .cols {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+                gap: 22px;
+            }
+            .cards {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+                gap: 14px;
+                margin-top: 22px;
+            }
+            .card {
+                background: var(--surface-1);
+                border: 1px solid var(--ring);
+                border-radius: 12px;
+                padding: 18px;
+            }
+            .card .step {
+                font-size: 0.75rem;
+                font-weight: 700;
+                letter-spacing: 0.06em;
+                text-transform: uppercase;
+                color: var(--ink-3);
+            }
+            .card p {
+                font-size: 0.92rem;
+                color: var(--ink-2);
+                margin-top: 6px;
+            }
+            pre {
+                background: var(--code-bg);
+                border: 1px solid var(--ring);
+                border-radius: 10px;
+                padding: 16px;
+                overflow-x: auto;
+                font-size: 0.88rem;
+                line-height: 1.5;
+                margin-top: 14px;
+            }
+            code {
+                font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            }
+            p code,
+            li code {
+                background: var(--code-bg);
+                padding: 1px 5px;
+                border-radius: 4px;
+                font-size: 0.88em;
+            }
+            .note {
+                background: var(--surface-1);
+                border: 1px solid var(--ring);
+                border-left: 3px solid var(--s-serve);
+                border-radius: 8px;
+                padding: 14px 16px;
+                font-size: 0.92rem;
+                color: var(--ink-2);
+                margin-top: 18px;
+            }
+            ul.tight {
+                margin: 10px 0 0 1.2em;
+                color: var(--ink-2);
+            }
+            ul.tight li {
+                margin-top: 6px;
+                font-size: 0.95rem;
+            }
+            footer {
+                padding: 40px 0 64px;
+                border-top: 1px solid var(--grid);
+                color: var(--ink-3);
+                font-size: 0.85rem;
+            }
+            .tooltip {
+                position: fixed;
+                pointer-events: none;
+                background: var(--ink-1);
+                color: var(--page);
+                padding: 7px 10px;
+                border-radius: 7px;
+                font-size: 0.78rem;
+                line-height: 1.45;
+                z-index: 10;
+                display: none;
+                font-variant-numeric: tabular-nums;
+                max-width: 260px;
+            }
+            .muted {
+                color: var(--ink-3);
+            }
+            @media (max-width: 680px) {
+                section { padding: 40px 0; }
+                header.hero { padding: 48px 0 40px; }
+                .fig { padding: 14px; }
+                .fig table { display: block; overflow-x: auto; white-space: nowrap; }
+                pre { font-size: 0.8rem; }
+                .cta .btn { flex: 1; text-align: center; }
+            }
+        </style>
+    </head>
+    <body>
+        <header class="hero wrap">
+            <span class="tag">yoro-cache · open source</span>
+            <h1>You Only Reason Once.<br />Cache the plan, not the answer.</h1>
+            <p class="sub">
+                Semantic caches save tokens until the world changes — then they
+                quietly serve stale answers. YORO is a drop-in OpenAI-compatible
+                proxy that <strong>invalidates on change</strong> and, instead
+                of re-deriving from scratch,
+                <strong>replays the reasoning it already paid for</strong>.
+                Every claim below is measured, on real models, with the
+                benchmark released alongside.
+            </p>
+            <div class="cta">
+                <a
+                    class="btn primary"
+                    href="https://github.com/ChaitanyaPinapaka/yoro-cache"
+                    >GitHub</a
+                >
+                <a class="btn ghost" href="#quickstart">Quickstart</a>
+                <a class="btn ghost" href="#receipts">The receipts</a>
+            </div>
+            <div class="tiles">
+                <div class="tile">
+                    <div class="big">0.90 → 0.00</div>
+                    <div class="lbl">
+                        cache staleness under drift, GPTCache-style vs YORO
+                    </div>
+                    <div class="src">E1′ · gpt-oss-120B · matched τ=0.90</div>
+                </div>
+                <div class="tile">
+                    <div class="big">96% vs 16%</div>
+                    <div class="lbl">
+                        accuracy at heavy drift — replay vs serve-or-stale
+                    </div>
+                    <div class="src">E7 · 5 rungs × 5 drift levels</div>
+                </div>
+                <div class="tile">
+                    <div class="big">~10–21%</div>
+                    <div class="lbl">
+                        of no-cache output tokens, while staying correct
+                    </div>
+                    <div class="src">E7 · replay tiers</div>
+                </div>
+                <div class="tile">
+                    <div class="big">2 families</div>
+                    <div class="lbl">
+                        divergence reproduces on gpt-oss-120B (H100) and
+                        Qwen2.5-32B (4-bit, consumer RTX 5090)
+                    </div>
+                    <div class="src">E5</div>
+                </div>
+            </div>
+        </header>
+
+        <section id="problem">
+            <div class="wrap">
+                <h2>1 · Semantic caches rot — faster than you think</h2>
+                <p class="lede">
+                    We swept drift rate (the fraction of recurring tasks whose
+                    true answer changes) on a clean, embedding-separable
+                    workload at matched thresholds. A no-invalidation semantic
+                    cache doesn't degrade politely:
+                    <strong
+                        >at just 5% drift, over half of its cache hits are
+                        already wrong</strong
+                    >, because popular items drift too — and every later hit on
+                    a drifted item serves the dead answer. YORO's dependency
+                    invalidation holds staleness at ~0 across the whole range.
+                </p>
+                <div class="cols">
+                    <div class="fig">
+                        <h3>Staleness vs drift rate</h3>
+                        <div class="sub">
+                            share of cache hits that serve a wrong answer · easy
+                            workload · τ=0.90 both
+                        </div>
+                        <div class="legend" id="lg-e1"></div>
+                        <div id="ch-e1stale"></div>
+                        <details>
+                            <summary>Data table</summary>
+                            <div id="tb-e1stale"></div>
+                        </details>
+                    </div>
+                    <div class="fig">
+                        <h3>Accuracy vs drift rate</h3>
+                        <div class="sub">
+                            same runs — what the user experiences
+                        </div>
+                        <div class="legend" id="lg-e1b"></div>
+                        <div id="ch-e1acc"></div>
+                        <details>
+                            <summary>Data table</summary>
+                            <div id="tb-e1acc"></div>
+                        </details>
+                    </div>
+                </div>
+                <div class="cols" style="margin-top: 22px">
+                    <div class="fig">
+                        <h3>Brittleness vs near-miss rate</h3>
+                        <div class="sub">look-alike queries force-fit into wrong reuse · fixed drift 0.05 · E2′</div>
+                        <div class="legend" id="lg-e2"></div>
+                        <div id="ch-e2brit"></div>
+                        <details><summary>Data table</summary><div id="tb-e2brit"></div></details>
+                    </div>
+                    <div class="fig">
+                        <h3>The honest trade: hit rate</h3>
+                        <div class="sub">YORO's gate declines risky reuse — hit rate falls, correctness holds at ~1.00</div>
+                        <div class="legend" id="lg-e2h"></div>
+                        <div id="ch-e2hit"></div>
+                        <details><summary>Data table</summary><div id="tb-e2hit"></div></details>
+                    </div>
+                </div>
+                <p class="note">
+                    <strong>Read the two panels together:</strong> the naive
+                    cache keeps its ~93% hit rate by force-fitting look-alikes —
+                    and its accuracy collapses to 0.29. YORO gives up hit rate
+                    (0.89 → 0.33 as near-misses rise) and keeps accuracy at
+                    ~1.00. That is the safety/savings trade, measured — not a
+                    free lunch, an honest dial.
+                </p>
+            </div>
+        </section>
+
+        <section id="twist">
+            <div class="wrap">
+                <h2>2 · The twist: invalidation alone isn't enough</h2>
+                <p class="lede">
+                    Add perfect invalidation and something surprising happens in
+                    agent workloads: accuracy <em>still</em> collapses. When the
+                    method behind an answer lives in earlier interactions (the
+                    normal case for long-running agents — "recompute it for the
+                    new numbers"), dropping the stale entry forces a
+                    re-derivation <em>without the method</em>. The engine
+                    re-derives wrong, caches it, and serves that. We call it
+                    <strong>re-poisoning</strong> — and it's measurable.
+                    Splitting every wrong same-entity serve by whether the
+                    served answer was <em>ever</em> correct:
+                </p>
+                <div class="fig" style="max-width: 720px">
+                    <h3>Why each cache is wrong, at drift 0.4</h3>
+                    <div class="sub">
+                        wrong serves split by failure mode · hard
+                        (method-in-history) workload · E7
+                    </div>
+                    <div class="legend">
+                        <span class="key"
+                            ><span
+                                class="swatch"
+                                style="background: var(--t-outdated)"
+                            ></span
+                            >outdated — was correct once, world moved</span
+                        >
+                        <span class="key"
+                            ><span
+                                class="swatch"
+                                style="background: var(--t-repoison)"
+                            ></span
+                            >re-poisoned — never correct, re-derived wrong &amp;
+                            cached</span
+                        >
+                    </div>
+                    <div id="ch-tax"></div>
+                    <details>
+                        <summary>Data table</summary>
+                        <div id="tb-tax"></div>
+                    </details>
+                </div>
+                <p style="margin-top: 16px; color: var(--ink-2)">
+                    The no-invalidation cache fails
+                    <em>outdated-heavy</em> (genuine staleness). The
+                    invalidating cache fails <em>~99% re-poisoned</em> — its
+                    invalidation is flawless; the failure is re-derivation, and
+                    note it manufactures <em>more</em> poison than the naive
+                    cache (3,369 vs 1,671): invalidation alone converts
+                    staleness into garbage production. Accuracy can't tell any
+                    of this apart; the taxonomy can. And the third bar is the
+                    resolution — replay makes the re-derivation succeed, so both
+                    failure modes collapse to 169 wrong serves total (§3).
+                </p>
+            </div>
+        </section>
+
+        <section id="fix">
+            <div class="wrap">
+                <h2>3 · The fix: replay the cached reasoning</h2>
+                <p class="lede">
+                    YORO stores the reasoning trace alongside every answer. When
+                    a dependency changes, it doesn't serve the frozen answer
+                    <em>or</em> re-derive blind — it
+                    <strong
+                        >replays the validated method against the new
+                        inputs</strong
+                    >: a short, exploration-free completion. Both replay tiers
+                    stay flat above ~90% accuracy while every alternative
+                    collapses; and the model's reasoning-effort setting becomes
+                    a cost dial.
+                </p>
+                <div class="fig">
+                    <h3>Accuracy vs drift — the four-tier result</h3>
+                    <div class="sub">
+                        hard workload (re-asks reference the established
+                        procedure) · gpt-oss-120B · E7
+                    </div>
+                    <div class="legend" id="lg-e7"></div>
+                    <div id="ch-e7acc"></div>
+                    <details>
+                        <summary>Data table</summary>
+                        <div id="tb-e7acc"></div>
+                    </details>
+                </div>
+                <div class="cols" style="margin-top: 22px">
+                    <div class="fig">
+                        <h3>Output tokens vs drift</h3>
+                        <div class="sub">
+                            thousands of generation tokens per stream · same
+                            runs
+                        </div>
+                        <div class="legend" id="lg-e7t"></div>
+                        <div id="ch-e7tok"></div>
+                        <details>
+                            <summary>Data table</summary>
+                            <div id="tb-e7tok"></div>
+                        </details>
+                    </div>
+                    <div class="fig">
+                        <h3>It's not a model quirk</h3>
+                        <div class="sub">
+                            same divergence on Qwen2.5-32B-Instruct, 4-bit AWQ,
+                            one consumer GPU · E5
+                        </div>
+                        <div class="legend" id="lg-e5"></div>
+                        <div id="ch-e5acc"></div>
+                        <details>
+                            <summary>Data table</summary>
+                            <div id="tb-e5acc"></div>
+                        </details>
+                    </div>
+                    <div class="fig">
+                        <h3>The signal is a dial, not an oracle</h3>
+                        <div class="sub">
+                            staleness as the invalidation signal weakens · fixed
+                            drift 0.3 · E4
+                        </div>
+                        <div class="legend" id="lg-e4"></div>
+                        <div id="ch-e4fid"></div>
+                        <details>
+                            <summary>Data table</summary>
+                            <div id="tb-e4fid"></div>
+                        </details>
+                    </div>
+                </div>
+                <p class="note">
+                    <strong>Honest scope:</strong> the stateless collapse here
+                    is by construction — these re-asks reference a procedure
+                    established earlier, the regime where memory is
+                    <em>necessary</em>. If every request restates its full
+                    context, a plain cache with invalidation is fine (§1 — YORO
+                    holds 1.00 accuracy there too). Replay is validated on
+                    multi-step arithmetic procedures so far; non-numeric
+                    procedures are future work. 4-bit quantization biases
+                    <em>against</em> replay (more arithmetic slips) — it
+                    dominates anyway. And the invalidation signal isn't an
+                    oracle: strip it and YORO degrades gracefully — staleness ≈
+                    the share of missed signals, converging exactly to the naive
+                    cache's 0.866 at zero signal. With the signal: ~zero.
+                </p>
+            </div>
+        </section>
+
+        <section id="how">
+            <div class="wrap">
+                <h2>4 · How it works: graduated reuse</h2>
+                <p class="lede">
+                    One gate, three tiers. Every request is embedded, matched
+                    against the case store, and routed to the cheapest tier
+                    that's <em>safe</em>:
+                </p>
+                <div class="fig" style="max-width: 860px">
+                    <h3>The request path</h3>
+                    <svg viewBox="0 0 860 200" role="img" style="max-width: 100%">
+                        <rect x="10" y="80" width="130" height="40" rx="8" fill="none" stroke="var(--ink-3)"/>
+                        <text x="75" y="104" text-anchor="middle" font-size="12" fill="var(--ink-1)">request</text>
+                        <rect x="190" y="80" width="170" height="40" rx="8" fill="none" stroke="var(--ink-3)"/>
+                        <text x="275" y="98" text-anchor="middle" font-size="12" fill="var(--ink-1)">embed + match</text>
+                        <text x="275" y="112" text-anchor="middle" font-size="10" fill="var(--ink-3)">nearest case · freshness</text>
+                        <line x1="140" y1="100" x2="190" y2="100" stroke="var(--ink-3)" marker-end="url(#a)"/>
+                        <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="var(--ink-3)"/></marker></defs>
+                        <line x1="360" y1="100" x2="430" y2="30" stroke="var(--s-replaylow)" marker-end="url(#a)"/>
+                        <line x1="360" y1="100" x2="430" y2="100" stroke="var(--s-replay)" marker-end="url(#a)"/>
+                        <line x1="360" y1="100" x2="430" y2="170" stroke="var(--ink-3)" marker-end="url(#a)"/>
+                        <rect x="435" y="10" width="180" height="40" rx="8" fill="var(--s-replaylow)" opacity="0.14"/>
+                        <rect x="435" y="10" width="180" height="40" rx="8" fill="none" stroke="var(--s-replaylow)"/>
+                        <text x="525" y="27" text-anchor="middle" font-size="12" font-weight="600" fill="var(--ink-1)">SERVE</text>
+                        <text x="525" y="41" text-anchor="middle" font-size="10" fill="var(--ink-2)">fresh + high sim → cached answer</text>
+                        <rect x="435" y="80" width="180" height="40" rx="8" fill="var(--s-replay)" opacity="0.14"/>
+                        <rect x="435" y="80" width="180" height="40" rx="8" fill="none" stroke="var(--s-replay)"/>
+                        <text x="525" y="97" text-anchor="middle" font-size="12" font-weight="600" fill="var(--ink-1)">REPLAY</text>
+                        <text x="525" y="111" text-anchor="middle" font-size="10" fill="var(--ink-2)">same case, deps changed → re-apply method</text>
+                        <rect x="435" y="150" width="180" height="40" rx="8" fill="none" stroke="var(--ink-3)"/>
+                        <text x="525" y="167" text-anchor="middle" font-size="12" font-weight="600" fill="var(--ink-1)">REASON</text>
+                        <text x="525" y="181" text-anchor="middle" font-size="10" fill="var(--ink-2)">novel / borderline → full reasoning, cache it</text>
+                        <text x="700" y="32" font-size="11" fill="var(--ink-2)">0 tokens</text>
+                        <text x="700" y="102" font-size="11" fill="var(--ink-2)">~10–21% of tokens</text>
+                        <text x="700" y="172" font-size="11" fill="var(--ink-2)">full cost, once</text>
+                    </svg>
+                </div>
+
+                <div class="cards">
+                    <div class="card">
+                        <div class="step">Tier 1 · Serve</div>
+                        <h3>Fresh + high similarity</h3>
+                        <p>
+                            Return the cached answer. Zero model calls, zero
+                            tokens. Dependency fingerprints scope every entry —
+                            a changed dep means this tier is off the table.
+                        </p>
+                    </div>
+                    <div class="card">
+                        <div class="step">Tier 2 · Replay</div>
+                        <h3>Same case, deps changed</h3>
+                        <p>
+                            Inject the stored reasoning trace:
+                            <em
+                                >“apply this validated procedure to the new
+                                inputs.”</em
+                            >
+                            Short output, no re-exploration. Reasoning effort
+                            dials cost vs accuracy (96%@21% or 92%@10% of
+                            no-cache tokens).
+                            Shipped in the library and benchmark today; the
+                            proxy tier lands in the next release.
+                        </p>
+                    </div>
+                    <div class="card">
+                        <div class="step">Tier 3 · Reason</div>
+                        <h3>Novel or borderline</h3>
+                        <p>
+                            Full reasoning on the upstream model. The trace and
+                            answer are cached with dependency fingerprints — so
+                            you only reason once.
+                        </p>
+                    </div>
+                </div>
+                <ul class="tight">
+                    <li>
+                        <strong>Safe by default:</strong> the proxy refuses to
+                        cache agentic (tool-bearing) or sampled turns — a stale
+                        hit can't corrupt an agent's file tree. Aggressive mode
+                        and per-request <code>X-YORO-Cache</code> are explicit
+                        opt-ins.
+                    </li>
+                    <li>
+                        <strong>Novelty gate:</strong> look-alike queries below
+                        the hit threshold escalate instead of force-fitting
+                        (that's the ~0 brittleness in E2′).
+                    </li>
+                    <li>
+                        <strong>Observability:</strong> every response carries
+                        <code>X-YORO-Cache: HIT|MISS|SKIP</code> +
+                        similarity; <code>/yoro/stats</code> has running totals.
+                    </li>
+                </ul>
+            </div>
+        </section>
+
+        <section id="quickstart">
+            <div class="wrap">
+                <h2>5 · Using it</h2>
+                <p class="lede">
+                    One base-URL change. Works with any OpenAI-compatible client
+                    or upstream (vLLM, llama.cpp server, OpenRouter, …).
+                </p>
+                <pre><code># install  (until the PyPI release: pip install git+https://github.com/ChaitanyaPinapaka/yoro-cache)
+pip install "yoro-cache[embed]"
+
+# example upstream: llama.cpp serving a local GGUF model
+brew install llama.cpp        # or your platform's build
+llama-server -m your-model.gguf --port 8000
+
+# run the proxy in front of it
+YORO_UPSTREAM=http://127.0.0.1:8000/v1 yoro serve        # listens on :8400
+
+# point your client at it — that's the whole integration
+export OPENAI_BASE_URL=http://127.0.0.1:8400/v1</code></pre>
+                <div class="cols" style="margin-top: 18px">
+                    <div>
+                        <h3>With OpenCode + a local model</h3>
+<pre><code># 1. serve a local model via llama.cpp
+#    (example: the one this page was tested with)
+llama-server -hf deepreinforce-ai/Ornith-1.0-35B-GGUF \
+             --port 8000
+
+# 2. put YORO in front of it
+YORO_UPSTREAM=http://127.0.0.1:8000/v1 yoro serve
+
+# 3. point OpenCode at the proxy — opencode.json:
+{ "provider": { "yoro": {
+    "npm": "@ai-sdk/openai-compatible",
+    "options": { "baseURL": "http://127.0.0.1:8400/v1" },
+    "models": { "ornith-35b": {} } } } }</code></pre>
+                        <p style="color: var(--ink-2); font-size: 0.92rem">
+                            Measured on this setup (35B Q4, M-series Mac):
+                            repeated asks serve in ~12&nbsp;ms vs ~3.3&nbsp;s
+                            upstream. The safe policy caches plain turns and
+                            passes tool-bearing (agentic) turns through
+                            untouched.
+                        </p>
+                    </div>
+                    <div>
+                        <h3>Watch it work</h3>
+<pre><code>$ curl -s :8400/yoro/stats
+{
+  "hit": 42, "miss": 17, "skip": 6,
+  "stored": 17, "served": 65,
+  "hit_rate": 0.646
+}</code></pre>
+                        <p style="color: var(--ink-2); font-size: 0.92rem">
+                            Every response carries the decision in its headers,
+                            so you can audit each reuse.
+                        </p>
+                    </div>
+                </div>
+                <div class="cols" style="margin-top: 18px">
+                    <div class="fig">
+                        <h3>The header contract</h3>
+                        <table style="width:100%">
+                            <tr><th>Header</th><th>Direction</th><th>Meaning</th></tr>
+                            <tr><td><code>X-YORO-Deps</code></td><td>request</td><td><code>name:fingerprint,…</code> — entry serves only while these match</td></tr>
+                            <tr><td><code>X-YORO-Cache: 0|1</code></td><td>request</td><td>force caching off / on for this call</td></tr>
+                            <tr><td><code>X-YORO-Cache</code></td><td>response</td><td><code>HIT</code> · <code>MISS</code> · <code>SKIP:&lt;reason&gt;</code></td></tr>
+                            <tr><td><code>X-YORO-Sim</code></td><td>response</td><td>similarity of the matched case</td></tr>
+                        </table>
+                    </div>
+                    <div class="fig">
+                        <h3>Configuration (env)</h3>
+                        <table style="width:100%">
+                            <tr><th>Variable</th><th>Default</th></tr>
+                            <tr><td><code>YORO_UPSTREAM</code></td><td><code>http://127.0.0.1:8000/v1</code></td></tr>
+                            <tr><td><code>YORO_PORT</code></td><td><code>8400</code></td></tr>
+                            <tr><td><code>YORO_POLICY</code></td><td><code>safe</code> (refuses agentic/sampled turns) · <code>aggressive</code></td></tr>
+                            <tr><td><code>YORO_TAU_HIT</code> / <code>YORO_TAU_MISS</code></td><td><code>0.95</code> / <code>0.6</code></td></tr>
+                            <tr><td><code>YORO_EMBED</code></td><td><code>all-MiniLM-L6-v2</code></td></tr>
+                            <tr><td><code>YORO_CACHE_PATH</code></td><td><code>~/.yoro/proxy_cache.json</code></td></tr>
+                        </table>
+                    </div>
+                </div>
+                <h3 style="margin-top: 26px">Bonus: mine your agent sessions into AGENTS.md</h3>
+                <p style="color: var(--ink-2)">
+                    For fully agentic tools, YORO can harvest the reusable
+                    <em>methods</em> from your past OpenCode sessions and keep a
+                    marked, auto-updating block in <code>AGENTS.md</code> —
+                    reasoning your future sessions inherit for free:
+                </p>
+                <pre><code>YORO_UPSTREAM=http://127.0.0.1:8000/v1 python -m yoro.opencode_behaviors --out AGENTS.md</code></pre>
+                <p class="note">
+                    <strong>Safe by default:</strong> the proxy refuses to cache
+                    tool-bearing (agentic) or sampled turns — a stale hit must
+                    never corrupt an agent's file tree. Cache entries only serve
+                    while their dependency fingerprints match; change the file
+                    and the entry stops serving. No deps header? The novelty
+                    gate and conservative defaults still apply.
+                </p>
+            </div>
+        </section>
+
+        <section id="receipts">
+            <div class="wrap">
+                <h2>6 · The receipts</h2>
+                <p class="lede">
+                    Every number on this page comes from a released benchmark
+                    you can run yourself: a tunable stress harness that injects
+                    <em>drift</em> (answers change),
+                    <em>near-misses</em> (look-alikes with different answers),
+                    and <em>signal loss</em> (invalidation fidelity) into
+                    Zipf-recurrent request streams — and scores staleness,
+                    brittleness, and the failure taxonomy against ground truth.
+                </p>
+                <ul class="tight">
+                    <li>
+                        <strong>Benchmark + harness:</strong>
+                        <a
+                            href="https://github.com/ChaitanyaPinapaka/yoro-cache"
+                            >github.com/ChaitanyaPinapaka/yoro-cache</a
+                        >
+                        — the harness (rungs, sweeps, per-event logs, one
+                        command per figure) lands there in an upcoming release.
+                    </li>
+                    <li>
+                        <strong>Experiments behind this page:</strong> E1′/E2′
+                        (safety divergence, 6 levels × ~15 seeds), E7 (four-tier
+                        Pareto, 5 rungs × 5 levels), E5 (second model family,
+                        quantized, consumer GPU), E4 (invalidation-fidelity
+                        envelope). Result curves arrive in the repo with the
+                        benchmark release.
+                    </li>
+                    <li>
+                        <strong>Scale:</strong> 25 sweep levels · 1,027
+                        (level×rung×seed) runs ·
+                        <strong>616,200 scored queries</strong> · 72.7M tokens
+                        (35.5M output + 37.2M input) · 2 model families on 2 GPU
+                        classes · ~17 GPU-hours ≈ $50 of compute for the
+                        reported experiments.
+                    </li>
+                    <li>
+                        <strong>Methodology:</strong> matched reuse thresholds
+                        across all rungs (τ=0.90 easy / 0.80 hard regime) ·
+                        workloads randomized per seed, 8–30 seeds per level with
+                        convergence early-stop · failure taxonomy defined by
+                        correctness lineage (<em>outdated</em> = served a
+                        once-correct answer; <em>re-poisoned</em> = served a
+                        never-correct one) and pinned by unit test · every
+                        query's decision, correctness, and token counts logged
+                        per event, so any metric re-derives offline.
+                    </li>
+                    <li>
+                        <strong>Failure taxonomy:</strong> <em>outdated</em> vs
+                        <em>re-poisoned</em> is a first-class metric (<code
+                            >outdated_rate</code
+                        >
+                        / <code>repoisoned_rate</code>), defined by correctness
+                        lineage and pinned by unit test.
+                    </li>
+                </ul>
+                <p class="note">
+                    <strong>Related work, honestly:</strong> template/thought
+                    reuse exists (Buffer of Thoughts, Metacognitive Reuse,
+                    Analogical Prompting). YORO's contribution is making reuse
+                    <em>safe and accounted</em> — invalidation, the staleness
+                    taxonomy, and input/output token accounting that a
+                    cheap-output claim can't hide behind.
+                </p>
+            </div>
+        </section>
+
+        <footer>
+            <div class="wrap">
+                YORO — You Only Reason Once · MIT ·
+                <a href="https://github.com/ChaitanyaPinapaka/yoro-cache"
+                    >GitHub</a
+                >
+                ·
+                <a href="https://yorocache.com">yorocache.com</a>
+                <div style="margin-top: 6px">
+                    Benchmarks: gpt-oss-120B (H100, vLLM) and
+                    Qwen2.5-32B-Instruct-AWQ (RTX 5090).
+                </div>
+            </div>
+        </footer>
+
+        <div class="tooltip" id="tt"></div>
+
+        <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+        <script>
+            /* All data below is from the released benchmark runs (per-level report.json aggregates). */
+            const D = {
+                e1: { x: [0, 0.05, 0.1, 0.2, 0.3, 0.4],
+                    stale: { "GPTCache-style": [0.0, 0.554, 0.692, 0.81, 0.866, 0.904], "YORO": [0.0, 0.0, 0.001, 0.003, 0.0, 0.001] },
+                    acc:   { "GPTCache-style": [1.0, 0.48, 0.35, 0.24, 0.19, 0.16], "YORO": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0] } },
+                e2: { x: [0, 0.05, 0.1, 0.2, 0.3, 0.4],
+                    brit: { "GPTCache-style": [0.0, 0.046, 0.092, 0.183, 0.277, 0.371], "YORO": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0] },
+                    hit:  { "GPTCache-style": [0.934, 0.933, 0.932, 0.932, 0.930, 0.931], "YORO": [0.889, 0.804, 0.724, 0.575, 0.444, 0.332] } },
+                e7: { x: [0, 0.1, 0.2, 0.3, 0.4],
+                    acc: { "YORO replay": [0.967, 0.948, 0.935, 0.953, 0.960], "YORO replay-low": [0.967, 0.913, 0.898, 0.893, 0.917],
+                           "YORO serve": [0.967, 0.353, 0.243, 0.191, 0.158], "GPTCache-style": [0.967, 0.353, 0.243, 0.192, 0.157],
+                           "no cache": [0.067, 0.067, 0.067, 0.068, 0.066] },
+                    tok: { "YORO replay": [10.3, 20.7, 32.2, 43.1, 53.4], "YORO replay-low": [10.2, 13.9, 17.6, 21.2, 25.0],
+                           "YORO serve": [10.1, 33.9, 57.9, 84.6, 105.1], "GPTCache-style": [10.2, 10.5, 10.9, 10.8, 10.9],
+                           "no cache": [246.2, 248.5, 249.3, 251.1, 247.9] } },
+                e5: { x: [0, 0.2, 0.4],
+                    acc: { "YORO replay": [0.950, 0.746, 0.741], "YORO serve": [0.950, 0.243, 0.164],
+                           "GPTCache-style": [0.950, 0.243, 0.164], "no cache": [0.065, 0.066, 0.066] } },
+                e4: { x: [0, 0.1, 0.3, 0.5, 1.0],
+                    stale: { "GPTCache-style": [0.866, 0.861, 0.861, 0.861, 0.866], "YORO": [0.0, 0.117, 0.321, 0.497, 0.866] } },
+                tax: [ { name: "GPTCache-style", outdated: 4365, repoisoned: 1671 },
+                       { name: "YORO serve", outdated: 20, repoisoned: 3369 },
+                       { name: "YORO + replay", outdated: 69, repoisoned: 100 } ],
+            };
+            const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+            const COLORS = {
+                "YORO replay": css("--s-replay"), "YORO replay-low": css("--s-replaylow"),
+                "YORO serve": css("--s-serve"), "GPTCache-style": css("--s-gptcache"),
+                "YORO": css("--s-replay"), "no cache": css("--s-nocache"),
+            };
+            const DASH = { "no cache": "5 4" };
+            const tt = d3.select("#tt");
+
+            function showTip(html, ev) {
+                tt.style("display", "block").html(html)
+                  .style("left", Math.min(ev.clientX + 14, innerWidth - 250) + "px")
+                  .style("top", ev.clientY + 14 + "px");
+            }
+            const hideTip = () => tt.style("display", "none");
+
+            function lineChart(id, x, series, opts) {
+                const o = Object.assign({ w: 480, h: 280, yMax: 1, yFmt: (v) => v.toFixed(2), xLbl: "drift rate",
+                                          m: { l: 46, r: 116, t: 14, b: 38 } }, opts || {});
+                const root = d3.select(id);
+                const svg = root.append("svg").attr("viewBox", `0 0 ${o.w} ${o.h}`).attr("role", "img");
+                const iw = o.w - o.m.l - o.m.r, ih = o.h - o.m.t - o.m.b;
+                const X = d3.scaleLinear().domain(d3.extent(x)).range([o.m.l, o.m.l + iw]);
+                const Y = d3.scaleLinear().domain([0, o.yMax]).range([o.m.t + ih, o.m.t]);
+                const names = Object.keys(series);
+                const hidden = new Set();
+
+                svg.append("g").selectAll("line").data(Y.ticks(4)).join("line")
+                    .attr("x1", o.m.l).attr("x2", o.m.l + iw).attr("y1", Y).attr("y2", Y)
+                    .attr("stroke", "var(--grid)");
+                svg.append("g").selectAll("text").data(Y.ticks(4)).join("text")
+                    .attr("x", o.m.l - 8).attr("y", (d) => Y(d) + 4).attr("text-anchor", "end")
+                    .attr("font-size", 10.5).attr("fill", "var(--ink-3)").text(o.yFmt);
+                svg.append("g").selectAll("text.x").data(x).join("text")
+                    .attr("x", X).attr("y", o.h - o.m.b + 16).attr("text-anchor", "middle")
+                    .attr("font-size", 10.5).attr("fill", "var(--ink-3)").text((d) => d);
+                svg.append("text").attr("x", o.m.l + iw / 2).attr("y", o.h - 4).attr("text-anchor", "middle")
+                    .attr("font-size", 10.5).attr("fill", "var(--ink-3)").text(o.xLbl);
+                svg.append("line").attr("x1", o.m.l).attr("x2", o.m.l + iw).attr("y1", Y(0)).attr("y2", Y(0))
+                    .attr("stroke", "var(--baseline)");
+
+                const line = d3.line().x((d, i) => X(x[i])).y((d) => Y(d));
+                const gs = {};
+                // collision-avoided direct end labels
+                const ends = names.map((n) => ({ n, y: Y(series[n][series[n].length - 1]) })).sort((a, b) => a.y - b.y);
+                for (let i = 1; i < ends.length; i++) if (ends[i].y - ends[i - 1].y < 13) ends[i].y = ends[i - 1].y + 13;
+
+                names.forEach((n) => {
+                    const g = svg.append("g");
+                    const path = g.append("path").datum(series[n]).attr("d", line).attr("fill", "none")
+                        .attr("stroke", COLORS[n]).attr("stroke-width", 2).attr("stroke-linecap", "round");
+                    if (DASH[n]) path.attr("stroke-dasharray", DASH[n]);
+                    else { // animated draw-in when scrolled into view
+                        const L = path.node().getTotalLength();
+                        path.attr("stroke-dasharray", `${L} ${L}`).attr("stroke-dashoffset", L);
+                        new IntersectionObserver((es, ob) => es.forEach((e) => { if (e.isIntersecting) {
+                            path.transition().duration(900).ease(d3.easeCubicOut).attr("stroke-dashoffset", 0)
+                                .on("end", () => path.attr("stroke-dasharray", null));
+                            ob.disconnect(); } }), { threshold: 0.3 }).observe(svg.node());
+                    }
+                    g.selectAll("circle").data(series[n]).join("circle")
+                        .attr("cx", (d, i) => X(x[i])).attr("cy", Y).attr("r", 3)
+                        .attr("fill", COLORS[n]).attr("stroke", "var(--surface-1)").attr("stroke-width", 2);
+                    const e = ends.find((e) => e.n === n);
+                    g.append("text").attr("x", o.m.l + iw + 8).attr("y", e.y + 4).attr("font-size", 10.5)
+                        .attr("font-weight", 600).attr("fill", COLORS[n]).text(n);
+                    gs[n] = g;
+                });
+
+                // crosshair + tooltip
+                const cross = svg.append("line").attr("stroke", "var(--ink-3)").attr("stroke-dasharray", "3 3")
+                    .attr("y1", o.m.t).attr("y2", o.m.t + ih).style("display", "none");
+                svg.append("rect").attr("x", o.m.l).attr("y", o.m.t).attr("width", iw).attr("height", ih)
+                    .attr("fill", "transparent")
+                    .style("touch-action", "none").on("pointermove", (ev) => {
+                        const [mx] = d3.pointer(ev);
+                        const i = d3.leastIndex(x, (a, b) => Math.abs(X(a) - mx) - Math.abs(X(b) - mx));
+                        cross.style("display", null).attr("x1", X(x[i])).attr("x2", X(x[i]));
+                        showTip(`<strong>${o.xLbl} ${x[i]}</strong><br>` + names.filter((n) => !hidden.has(n))
+                            .map((n) => `<span style="color:${COLORS[n]}">●</span> ${n}: ${o.yFmt(series[n][i])}`)
+                            .join("<br>"), ev);
+                    })
+                    .on("pointerleave", () => { cross.style("display", "none"); hideTip(); });
+
+                // clickable legend: toggle series (fades, never recolors survivors)
+                if (o.legend) {
+                    const lg = d3.select(o.legend);
+                    names.forEach((n) => {
+                        const key = lg.append("span").attr("class", "key").style("cursor", "pointer")
+                            .html(`<span class="swatch" style="background:${COLORS[n]}"></span>${n}`);
+                        key.on("click", () => {
+                            hidden.has(n) ? hidden.delete(n) : hidden.add(n);
+                            const off = hidden.has(n);
+                            gs[n].transition().duration(250).style("opacity", off ? 0.12 : 1);
+                            key.style("opacity", off ? 0.4 : 1);
+                        });
+                    });
+                }
+                if (o.table) {
+                    let h = `<table><tr><th>${o.xLbl}</th>${names.map((n) => `<th>${n}</th>`).join("")}</tr>`;
+                    x.forEach((v, i) => { h += `<tr><td>${v}</td>${names.map((n) => `<td>${o.yFmt(series[n][i])}</td>`).join("")}</tr>`; });
+                    d3.select(o.table).html(h + "</table>");
+                }
+            }
+
+            function taxChart(id) {
+                const w = 640, pl = 150, pr = 150, bh = 34, gap = 30, h = 24 + D.tax.length * (bh + gap);
+                const svg = d3.select(id).append("svg").attr("viewBox", `0 0 ${w} ${h}`);
+                const max = d3.max(D.tax, (r) => r.outdated + r.repoisoned);
+                const W = d3.scaleLinear().domain([0, max]).range([0, w - pl - pr]);
+                D.tax.forEach((r, i) => {
+                    const y = 24 + i * (bh + gap), total = r.outdated + r.repoisoned;
+                    svg.append("text").attr("x", pl - 10).attr("y", y + bh / 2 + 4).attr("text-anchor", "end")
+                        .attr("font-size", 12).attr("font-weight", 600).attr("fill", "var(--ink-1)").text(r.name);
+                    svg.append("text").attr("x", pl).attr("y", y - 6).attr("font-size", 10.5)
+                        .attr("fill", "var(--ink-3)").text(`${total.toLocaleString()} wrong serves`);
+                    const segs = [ { k: "outdated", v: r.outdated, c: "var(--t-outdated)", x0: 0 },
+                                   { k: "re-poisoned", v: r.repoisoned, c: "var(--t-repoison)", x0: r.outdated } ];
+                    segs.forEach((s) => {
+                        svg.append("rect").attr("x", pl + W(s.x0) + (s.x0 ? 2 : 0)).attr("y", y).attr("height", bh)
+                            .attr("rx", 4).attr("fill", s.c).attr("width", 0)
+                            .on("pointermove", (ev) => showTip(`<strong>${r.name}</strong><br>${s.k}: ${s.v.toLocaleString()} (${Math.round((100 * s.v) / total)}%)`, ev))
+                            .on("pointerleave", hideTip)
+                            .transition().duration(800).ease(d3.easeCubicOut).attr("width", Math.max(W(s.v) - (s.x0 ? 2 : 0), 1));
+                    });
+                    svg.append("text").attr("x", pl + W(total) + 10).attr("y", y + bh / 2 + 4)
+                        .attr("font-size", 11.5).attr("fill", "var(--ink-2)")
+                        .text(`${Math.round((100 * r.repoisoned) / total)}% re-poisoned`);
+                });
+                d3.select("#tb-tax").html(`<table><tr><th>rung</th><th>outdated</th><th>re-poisoned</th></tr>` +
+                    D.tax.map((r) => `<tr><td>${r.name}</td><td>${r.outdated.toLocaleString()}</td><td>${r.repoisoned.toLocaleString()}</td></tr>`).join("") + `</table>`);
+            }
+
+            const two = { m: { l: 46, r: 112, t: 14, b: 38 } };
+            lineChart("#ch-e1stale", D.e1.x, D.e1.stale, { ...two, legend: "#lg-e1", table: "#tb-e1stale", yFmt: (v) => v.toFixed(3) });
+            lineChart("#ch-e1acc", D.e1.x, D.e1.acc, { ...two, legend: "#lg-e1b", table: "#tb-e1acc" });
+            lineChart("#ch-e2brit", D.e2.x, D.e2.brit, { ...two, legend: "#lg-e2", table: "#tb-e2brit", yMax: 0.5, xLbl: "near-miss rate", yFmt: (v) => v.toFixed(3) });
+            lineChart("#ch-e2hit", D.e2.x, D.e2.hit, { ...two, legend: "#lg-e2h", table: "#tb-e2hit", xLbl: "near-miss rate" });
+            taxChart("#ch-tax");
+            lineChart("#ch-e7acc", D.e7.x, D.e7.acc, { w: 920, h: 330, m: { l: 46, r: 150, t: 14, b: 38 }, legend: "#lg-e7", table: "#tb-e7acc" });
+            lineChart("#ch-e7tok", D.e7.x, D.e7.tok, { ...two, m: { l: 50, r: 116, t: 14, b: 38 }, legend: "#lg-e7t", table: "#tb-e7tok", yMax: 260, yFmt: (v) => v.toFixed(0) + "k" });
+            lineChart("#ch-e5acc", D.e5.x, D.e5.acc, { ...two, legend: "#lg-e5", table: "#tb-e5acc" });
+            lineChart("#ch-e4fid", D.e4.x, D.e4.stale, { ...two, legend: "#lg-e4", table: "#tb-e4fid", xLbl: "share of missed signals", yFmt: (v) => v.toFixed(3) });
+        </script>
+    </body>
+</html>

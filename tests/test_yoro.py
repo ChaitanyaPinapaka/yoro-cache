@@ -1,0 +1,171 @@
+"""Plain-assert tests. Run directly (`.venv/bin/python tests/test_yoro.py`) or with
+pytest. Covers the data structure, the three mechanisms, the end-to-end loop, and
+the decision-tree router."""
+
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from yoro import (
+    YORO,
+    Decision,
+    HashEmbedder,
+    Invalidator,
+    Matcher,
+    ReasoningCache,
+    ReasoningCase,
+    ReasoningTreeRouter,
+    cosine,
+)
+
+
+class World:
+    """Minimal drifting world: each task family has a current answer + a version
+    fingerprint; drift() changes both. Enough to exercise reuse/invalidate/update."""
+
+    def __init__(self):
+        self.ver: dict[str, int] = {}
+
+    def register(self, fam):
+        self.ver.setdefault(fam, 1)
+
+    def family_of(self, task):
+        return task.split()[0]
+
+    def answer(self, fam):
+        return f"{fam}-answer-v{self.ver.get(fam, 1)}"
+
+    def deps(self, fam):
+        self.register(fam)
+        return {fam: f"{fam}#{self.ver[fam]}"}
+
+    def drift(self, fam):
+        self.ver[fam] = self.ver.get(fam, 1) + 1
+
+
+class MockModel:
+    """Perfect-but-counted reasoner over the World — every measured error is a
+    CACHE error (stale/brittle reuse), never a model error."""
+
+    name = "mock"
+
+    def __init__(self, world):
+        self.world = world
+        self.calls = 0
+
+    def reason(self, task):
+        self.calls += 1
+        fam = self.world.family_of(task)
+        ans = self.world.answer(fam)
+        return (f"[reason] family={fam} -> {ans}", ans)
+
+    def complete(self, prompt, max_tokens=None):
+        return ""
+
+
+def test_embedder_similarity():
+    e = HashEmbedder(64)
+    a = e.embed("famA aw0 aw1 aw2 aw3")
+    b = e.embed("famA aw0 aw1 aw2 aw3")
+    c = e.embed("famZ zz0 zz1 zz2 zz3")
+    assert cosine(a, b) > 0.999  # identical -> ~1
+    assert cosine(a, c) < 0.5  # disjoint -> low
+
+
+def test_cache_roundtrip():
+    e = HashEmbedder(64)
+    c = ReasoningCache()
+    c.add("t1", e.embed("famA aw0 aw1 aw2 aw3"), "r1", "o1", {"src": "A#1"})
+    c.add("t2", e.embed("famB bw0 bw1 bw2 bw3"), "r2", "o2", {"src": "B#1"})
+    case, sim = c.nearest(e.embed("famA aw0 aw1 aw2 aw3"))
+    assert case.outcome == "o1" and sim > 0.99
+    f = tempfile.mktemp(suffix=".json")
+    c.save(f)
+    c2 = ReasoningCache().load(f)
+    assert len(c2) == 2 and c2.cases[0].outcome == "o1"
+    assert isinstance(c2.cases[0].embedding, np.ndarray)
+    os.remove(f)
+
+
+def test_matcher():
+    m = Matcher(tau_hit=0.9, tau_miss=0.6, novelty_gate=True)
+    assert m.decide(0.95, True) == Decision.HIT
+    assert m.decide(0.95, False) == Decision.ESCALATE  # right case but stale
+    assert m.decide(0.75, True) == Decision.ESCALATE  # borderline + gate -> safe
+    assert m.decide(0.40, True) == Decision.MISS
+    m2 = Matcher(tau_hit=0.9, tau_miss=0.6, novelty_gate=False)
+    assert m2.decide(0.75, True) == Decision.HIT  # gate off -> force-fit
+
+
+def test_invalidator():
+    c = ReasoningCase(
+        id="x",
+        task="t",
+        embedding=np.zeros(4, dtype=np.float32),
+        reasoning="r",
+        outcome="o",
+        deps={"src": "A#1"},
+    )
+    inv = Invalidator(use_deps=True, use_ttl=False, use_reliability=False)
+    assert inv.is_fresh(c, {"src": "A#1"}) is True
+    assert inv.is_fresh(c, {"src": "A#2"}) is False  # premise changed -> stale
+    inv_off = Invalidator(use_deps=False, use_ttl=False, use_reliability=False)
+    assert inv_off.is_fresh(c, {"src": "A#2"}) is True  # deps toggle off: drift ignored
+
+
+def test_end_to_end_reason_once_reuse_update():
+    world = World()
+    world.register("famA")
+    e = HashEmbedder(64)
+    model = MockModel(world)
+    engine = YORO(
+        model,
+        e,
+        ReasoningCache(),
+        Matcher(0.9, 0.6, True),
+        Invalidator(use_deps=True, use_ttl=False, use_reliability=False),
+    )
+    txt = "famA famaw0 famaw1 famaw2 famaw3"
+
+    r1 = engine.solve(txt, current_deps=world.deps("famA"))
+    assert r1.reasoned and r1.decision == "cold" and model.calls == 1
+
+    r2 = engine.solve(txt, current_deps=world.deps("famA"))
+    assert (
+        (not r2.reasoned) and r2.decision == "hit" and model.calls == 1
+    )  # the YORO win: reused
+
+    world.drift("famA")  # the world changed
+    r3 = engine.solve(txt, current_deps=world.deps("famA"))
+    assert (
+        r3.reasoned and r3.decision == "update" and model.calls == 2
+    )  # caught stale -> re-reason + UPDATE
+    assert r3.outcome == world.answer("famA")  # returns the NEW answer
+
+    rn = engine.solve(
+        "famZ famzz0 famzz1 famzz2 famzz3", current_deps=world.deps("famZ")
+    )
+    assert rn.reasoned and rn.decision == "cold"  # novel -> reason fresh
+
+
+def test_tree_router():
+    e = HashEmbedder(64)
+    c = ReasoningCache()
+    c.add("a", e.embed("famA aw0 aw1 aw2 aw3"), "r", "o1")
+    c.add("b", e.embed("famB bw0 bw1 bw2 bw3"), "r", "o2")
+    rt = ReasoningTreeRouter().fit(c)
+    assert rt.route(e.embed("famA aw0 aw1 aw2 aw3")) == c.cases[0].id
+
+
+if __name__ == "__main__":
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    for t in tests:
+        t()
+        print(f"  ok  {t.__name__}")
+    print(f"\nALL {len(tests)} TESTS PASSED")
