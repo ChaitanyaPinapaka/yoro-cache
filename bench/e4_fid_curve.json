@@ -1,0 +1,77 @@
+{
+  "run": "e4-fid",
+  "sweep_param": "inval_fidelity",
+  "metric": "yoro benefit/safety vs inval_fidelity",
+  "curve": [
+    {
+      "sweep_param": "inval_fidelity",
+      "sweep_val": 1.0,
+      "inval_fidelity": 1.0,
+      "seeds": 12,
+      "yoro_hit_rate": 0.6513888888888889,
+      "yoro_accuracy": 1.0,
+      "yoro_staleness": 0.0,
+      "yoro_brittleness": 0.0,
+      "yoro_tokens_total": 18325.833333333332,
+      "delta_accuracy": 0.8079166666666667,
+      "delta_staleness": -0.8658758979309997,
+      "delta_brittleness": 0.0
+    },
+    {
+      "sweep_param": "inval_fidelity",
+      "sweep_val": 0.9,
+      "inval_fidelity": 0.9,
+      "seeds": 15,
+      "yoro_hit_rate": 0.6822222222222222,
+      "yoro_accuracy": 0.9198888888888889,
+      "yoro_staleness": 0.11745856842909284,
+      "yoro_brittleness": 0.0,
+      "yoro_tokens_total": 16557.866666666665,
+      "delta_accuracy": 0.7233333333333333,
+      "delta_staleness": -0.7437424299056187,
+      "delta_brittleness": 0.0
+    },
+    {
+      "sweep_param": "inval_fidelity",
+      "sweep_val": 0.7,
+      "inval_fidelity": 0.7,
+      "seeds": 15,
+      "yoro_hit_rate": 0.7360000000000001,
+      "yoro_accuracy": 0.7633333333333333,
+      "yoro_staleness": 0.32120578407375233,
+      "yoro_brittleness": 0.0,
+      "yoro_tokens_total": 13681.533333333333,
+      "delta_accuracy": 0.5667777777777778,
+      "delta_staleness": -0.5399952142609593,
+      "delta_brittleness": 0.0
+    },
+    {
+      "sweep_param": "inval_fidelity",
+      "sweep_val": 0.5,
+      "inval_fidelity": 0.5,
+      "seeds": 15,
+      "yoro_hit_rate": 0.7928888888888889,
+      "yoro_accuracy": 0.6061111111111112,
+      "yoro_staleness": 0.4965274543480102,
+      "yoro_brittleness": 0.0,
+      "yoro_tokens_total": 10656.733333333334,
+      "delta_accuracy": 0.4095555555555555,
+      "delta_staleness": -0.36467354398670143,
+      "delta_brittleness": 0.0
+    },
+    {
+      "sweep_param": "inval_fidelity",
+      "sweep_val": 0.0,
+      "inval_fidelity": 0.0,
+      "seeds": 12,
+      "yoro_hit_rate": 0.9330555555555556,
+      "yoro_accuracy": 0.19208333333333336,
+      "yoro_staleness": 0.8658758979309997,
+      "yoro_brittleness": 0.0,
+      "yoro_tokens_total": 3290.1666666666665,
+      "delta_accuracy": 0.0,
+      "delta_staleness": 0.0,
+      "delta_brittleness": 0.0
+    }
+  ]
+}

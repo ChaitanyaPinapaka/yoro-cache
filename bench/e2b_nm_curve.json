@@ -1,0 +1,91 @@
+{
+  "run": "e2b-nm",
+  "sweep_param": "near_miss_rate",
+  "metric": "yoro benefit/safety vs near_miss_rate",
+  "curve": [
+    {
+      "sweep_param": "near_miss_rate",
+      "sweep_val": 0.0,
+      "near_miss_rate": 0.0,
+      "seeds": 15,
+      "yoro_hit_rate": 0.8893333333333333,
+      "yoro_accuracy": 0.9987777777777779,
+      "yoro_staleness": 0.0011208031138864774,
+      "yoro_brittleness": 0.0,
+      "yoro_tokens_total": 5739.0,
+      "delta_accuracy": 0.5164444444444444,
+      "delta_staleness": -0.5531254463086908,
+      "delta_brittleness": 0.0
+    },
+    {
+      "sweep_param": "near_miss_rate",
+      "sweep_val": 0.05,
+      "near_miss_rate": 0.05,
+      "seeds": 15,
+      "yoro_hit_rate": 0.8041111111111111,
+      "yoro_accuracy": 0.9986666666666667,
+      "yoro_staleness": 0.0013655940036308135,
+      "yoro_brittleness": 0.0,
+      "yoro_tokens_total": 10116.533333333333,
+      "delta_accuracy": 0.5433333333333333,
+      "delta_staleness": -0.5327457427085281,
+      "delta_brittleness": -0.04611111111111111
+    },
+    {
+      "sweep_param": "near_miss_rate",
+      "sweep_val": 0.1,
+      "near_miss_rate": 0.1,
+      "seeds": 15,
+      "yoro_hit_rate": 0.7236666666666667,
+      "yoro_accuracy": 0.9991111111111111,
+      "yoro_staleness": 0.0010416666666666667,
+      "yoro_brittleness": 0.0,
+      "yoro_tokens_total": 14227.133333333333,
+      "delta_accuracy": 0.5674444444444444,
+      "delta_staleness": -0.5099791784337019,
+      "delta_brittleness": -0.092
+    },
+    {
+      "sweep_param": "near_miss_rate",
+      "sweep_val": 0.2,
+      "near_miss_rate": 0.2,
+      "seeds": 15,
+      "yoro_hit_rate": 0.5753333333333334,
+      "yoro_accuracy": 0.9998888888888888,
+      "yoro_staleness": 0.0,
+      "yoro_brittleness": 0.0,
+      "yoro_tokens_total": 22114.666666666668,
+      "delta_accuracy": 0.616,
+      "delta_staleness": -0.4643437238320526,
+      "delta_brittleness": -0.1831111111111111
+    },
+    {
+      "sweep_param": "near_miss_rate",
+      "sweep_val": 0.3,
+      "near_miss_rate": 0.3,
+      "seeds": 15,
+      "yoro_hit_rate": 0.4442222222222222,
+      "yoro_accuracy": 0.9998888888888888,
+      "yoro_staleness": 0.0,
+      "yoro_brittleness": 0.0,
+      "yoro_tokens_total": 28941.866666666665,
+      "delta_accuracy": 0.660888888888889,
+      "delta_staleness": -0.4132925061311885,
+      "delta_brittleness": -0.27655555555555555
+    },
+    {
+      "sweep_param": "near_miss_rate",
+      "sweep_val": 0.4,
+      "near_miss_rate": 0.4,
+      "seeds": 15,
+      "yoro_hit_rate": 0.3318888888888889,
+      "yoro_accuracy": 0.9997777777777778,
+      "yoro_staleness": 0.0,
+      "yoro_brittleness": 0.0,
+      "yoro_tokens_total": 34717.86666666667,
+      "delta_accuracy": 0.7072222222222223,
+      "delta_staleness": -0.3617301623334101,
+      "delta_brittleness": -0.37066666666666664
+    }
+  ]
+}

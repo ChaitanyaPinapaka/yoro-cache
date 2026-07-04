@@ -178,11 +178,10 @@ release.
 
 ```
 yoro/    library and proxy: cache, matcher, invalidation, replay, CLI
-tests/   library and proxy tests; no GPU required
+bench/   the benchmark harness: rungs, sweeps, taxonomy metrics, result curves, runbook
+tests/   library, proxy, and benchmark tests; no GPU required
 site/    yorocache.com (static)
 ```
-
-The benchmark harness (`bench/`) and result curves arrive in an upcoming release.
 
 ## License
 

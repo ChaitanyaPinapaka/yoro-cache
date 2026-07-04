@@ -1,0 +1,49 @@
+{
+  "run": "e5-qwen",
+  "sweep_param": "drift_rate",
+  "metric": "yoro benefit/safety vs drift_rate",
+  "curve": [
+    {
+      "sweep_param": "drift_rate",
+      "sweep_val": 0.0,
+      "drift_rate": 0.0,
+      "seeds": 8,
+      "yoro_hit_rate": 0.9329166666666667,
+      "yoro_accuracy": 0.9502083333333333,
+      "yoro_staleness": 0.051644468879830076,
+      "yoro_brittleness": 0.0,
+      "yoro_tokens_total": 7510.5,
+      "delta_accuracy": 0.0,
+      "delta_staleness": 0.0,
+      "delta_brittleness": 0.0
+    },
+    {
+      "sweep_param": "drift_rate",
+      "sweep_val": 0.2,
+      "drift_rate": 0.2,
+      "seeds": 8,
+      "yoro_hit_rate": 0.7470833333333333,
+      "yoro_accuracy": 0.24270833333333333,
+      "yoro_staleness": 0.7634238579895688,
+      "yoro_brittleness": 0.0,
+      "yoro_tokens_total": 17618.75,
+      "delta_accuracy": 0.0,
+      "delta_staleness": -0.046559472973288524,
+      "delta_brittleness": 0.0
+    },
+    {
+      "sweep_param": "drift_rate",
+      "sweep_val": 0.4,
+      "drift_rate": 0.4,
+      "seeds": 8,
+      "yoro_hit_rate": 0.5614583333333334,
+      "yoro_accuracy": 0.16416666666666668,
+      "yoro_staleness": 0.8240442790858227,
+      "yoro_brittleness": 0.0,
+      "yoro_tokens_total": 27934.875,
+      "delta_accuracy": 0.0,
+      "delta_staleness": -0.0702003524346449,
+      "delta_brittleness": 0.0
+    }
+  ]
+}

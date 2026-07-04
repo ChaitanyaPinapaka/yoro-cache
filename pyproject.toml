@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yoro-cache"
-version = "0.1.0"
+version = "0.1.1"
 description = "YORO — You Only Reason Once. A drop-in LLM caching proxy that invalidates on change and replays cached reasoning instead of serving stale answers."
 readme = "README.md"
 license = { text = "MIT" }
@@ -35,7 +35,7 @@ Homepage = "https://yorocache.com"
 Repository = "https://github.com/ChaitanyaPinapaka/yoro-cache"
 
 [tool.setuptools]
-packages = ["yoro"]
+packages = ["yoro", "bench"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

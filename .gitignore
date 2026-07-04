@@ -8,3 +8,4 @@ runs/
 *.cache.json
 .DS_Store
 .pytest_cache/
+.wrangler/
