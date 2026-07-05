@@ -152,6 +152,17 @@ Cache-slot adapters serve and invalidate but cannot call the model, so the repla
 tier applies to the proxy; in the adapters a changed dependency simply misses
 (correct, never stale).
 
+## Examples
+
+[`examples/`](examples/) has one runnable, measured benchmark per surface: the
+proxy with git as the signal, the LiteLLM cache slot, the LangChain LLM cache,
+and the MCP bridge end to end. Each runs the same recurring-tasks-then-drift
+workload with and without YORO, over multiple independent iterations, against a
+local model, and checks every answer against a deterministic gold value. Measured
+on Ornith-1.0-35B: 48-50% of output tokens saved and roughly half of model calls
+avoided, with zero stale answers after drift. See
+[`examples/README.md`](examples/README.md) for the tables.
+
 ## Evaluation
 
 The claims above are measured, on gpt-oss-120B (H100, vLLM) and reproduced on
@@ -178,8 +189,7 @@ drift 0.4 on the method-in-history workload:
   share of missed signals and converges to naive-cache behavior at zero signal.
 
 The full benchmark harness (sweep driver, workload generators, taxonomy metrics,
-and the result curves behind these numbers) lands in this repository in an upcoming
-release.
+and the runbook behind these numbers) lives in [`bench/`](bench/).
 
 ## Scope and limitations
 
@@ -200,10 +210,11 @@ release.
 ## Repository layout
 
 ```
-yoro/    library and proxy: cache, matcher, invalidation, replay, CLI
-bench/   the benchmark harness: rungs, sweeps, taxonomy metrics, result curves, runbook
-tests/   library, proxy, and benchmark tests; no GPU required
-site/    yorocache.com (static)
+yoro/      library and proxy: cache, matcher, invalidation, replay, CLI
+bench/     the benchmark harness: rungs, sweeps, taxonomy metrics, result curves, runbook
+examples/  runnable with-and-without benchmarks for each integration surface
+tests/     library, proxy, and benchmark tests; no GPU required
+site/      yorocache.com (static)
 ```
 
 ## License
