@@ -12,7 +12,9 @@ from yoro import HashEmbedder
 def test_litellm_semantic_cache_hit_and_invalidation(tmp_path):
     import json
 
-    import litellm
+    import pytest
+
+    litellm = pytest.importorskip("litellm")
     from litellm.caching.caching import Cache
     from yoro.integrations.litellm_cache import YoroSemanticCache
     from yoro import deps as depsmod
@@ -48,6 +50,9 @@ def test_litellm_semantic_cache_hit_and_invalidation(tmp_path):
 def test_langchain_cache_hit_scoping_and_invalidation(tmp_path):
     import json
 
+    import pytest
+
+    pytest.importorskip("langchain_core")
     from langchain_core.outputs import Generation
     from yoro.integrations.langchain_cache import YoroLangChainCache
     from yoro import deps as depsmod
@@ -81,6 +86,9 @@ def test_mcp_bridge_fingerprints_resources(tmp_path):
     import asyncio
     import json
 
+    import pytest
+
+    pytest.importorskip("mcp")
     from mcp.server.fastmcp import FastMCP
     from mcp.shared.memory import create_connected_server_and_client_session
     from yoro.integrations.mcp_bridge import run_bridge

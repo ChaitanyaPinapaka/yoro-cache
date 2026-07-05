@@ -13,4 +13,6 @@ jobs:
       # the full suite skips real-embedder tests when sentence-transformers is absent;
       # install it so separability invariants are enforced in CI too
       - run: pip install sentence-transformers
+      # exercise the integration adapters against the real libraries
+      - run: pip install litellm langchain-core mcp
       - run: pytest -q
