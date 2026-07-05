@@ -342,10 +342,11 @@
             <h1>You Only Reason Once.<br />Cache the plan, not the answer.</h1>
             <p class="sub">
                 Semantic caches save tokens until the world changes — then they
-                quietly serve stale answers. YORO is a drop-in OpenAI-compatible
-                proxy that <strong>invalidates on change</strong> and, instead
-                of re-deriving from scratch,
-                <strong>replays the reasoning it already paid for</strong>.
+                quietly serve stale answers. YORO is procedural memory for LLM
+                systems: a drop-in OpenAI-compatible proxy that
+                <strong>invalidates on change</strong> and, instead of
+                re-deriving from scratch,
+                <strong>replays the derivation it already paid for</strong>.
                 Every claim below is measured, on real models, with the
                 benchmark released alongside.
             </p>
@@ -666,8 +667,8 @@
                             Short output, no re-exploration. Reasoning effort
                             dials cost vs accuracy (96%@21% or 92%@10% of
                             no-cache tokens).
-                            Shipped in the library and benchmark today; the
-                            proxy tier lands in the next release.
+                            Live in the proxy as of v0.1.2: responses carry
+                            X-YORO-Cache: REPLAY.
                         </p>
                     </div>
                     <div class="card">
@@ -766,7 +767,7 @@ YORO_UPSTREAM=http://127.0.0.1:8000/v1 yoro serve
                             <tr><th>Header</th><th>Direction</th><th>Meaning</th></tr>
                             <tr><td><code>X-YORO-Deps</code></td><td>request</td><td><code>name:fingerprint,…</code> — entry serves only while these match</td></tr>
                             <tr><td><code>X-YORO-Cache: 0|1</code></td><td>request</td><td>force caching off / on for this call</td></tr>
-                            <tr><td><code>X-YORO-Cache</code></td><td>response</td><td><code>HIT</code> · <code>MISS</code> · <code>SKIP:&lt;reason&gt;</code></td></tr>
+                            <tr><td><code>X-YORO-Cache</code></td><td>response</td><td><code>HIT</code> · <code>REPLAY</code> · <code>MISS</code> · <code>SKIP:&lt;reason&gt;</code></td></tr>
                             <tr><td><code>X-YORO-Sim</code></td><td>response</td><td>similarity of the matched case</td></tr>
                         </table>
                     </div>
@@ -795,9 +796,17 @@ YORO_UPSTREAM=http://127.0.0.1:8000/v1 yoro serve
                     <strong>Safe by default:</strong> the proxy refuses to cache
                     tool-bearing (agentic) or sampled turns — a stale hit must
                     never corrupt an agent's file tree. Cache entries only serve
-                    while their dependency fingerprints match; change the file
-                    and the entry stops serving. No deps header? The novelty
-                    gate and conservative defaults still apply.
+                    while their dependency fingerprints match; when they change,
+                    the proxy replays the stored derivation against the new
+                    inputs instead of serving stale. Signals can come from the
+                    request header, from <code>yoro serve --git .</code> (the
+                    working tree as one dependency — the natural signal for
+                    coding agents), from a sidecar deps-file, or from an MCP
+                    server's resources via <code>yoro mcp-bridge</code>.
+                    Adapters ship for LiteLLM and LangChain
+                    (<code>pip install "yoro-cache[litellm]"</code> /
+                    <code>[langchain]</code>): same gate, same invalidation,
+                    inside your existing stack.
                 </p>
             </div>
         </section>

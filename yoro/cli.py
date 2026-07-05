@@ -35,6 +35,24 @@ def main(argv=None) -> int:
         default=None,
         help="caching policy (default $YORO_POLICY or safe)",
     )
+    sv.add_argument(
+        "--git",
+        default=None,
+        metavar="REPO",
+        help="fingerprint this git working tree as an automatic dependency "
+        "(any commit or edit invalidates entries scoped to it)",
+    )
+    sv.add_argument(
+        "--deps-file",
+        default=None,
+        metavar="JSON",
+        help="JSON file of {name: fingerprint} maintained by a sidecar (file watcher, MCP bridge)",
+    )
+
+    mb = sub.add_parser("mcp-bridge", help="mirror an MCP server's resources into a deps-file")
+    mb.add_argument("--server", required=True, help="command that runs the MCP server (stdio)")
+    mb.add_argument("--deps-file", required=True)
+    mb.add_argument("--interval", type=float, default=5.0)
 
     st = sub.add_parser("stats", help="show a running proxy's cache stats")
     st.add_argument(
@@ -50,10 +68,20 @@ def main(argv=None) -> int:
             os.environ["YORO_PORT"] = str(a.port)
         if a.policy:
             os.environ["YORO_POLICY"] = a.policy
+        if a.git:
+            os.environ["YORO_GIT"] = a.git
+        if a.deps_file:
+            os.environ["YORO_DEPS_FILE"] = a.deps_file
         from .proxy import main as serve_main
 
         serve_main()
         return 0
+    if a.cmd == "mcp-bridge":
+        from .integrations.mcp_bridge import main as bridge_main
+
+        return bridge_main([
+            "--server", a.server, "--deps-file", a.deps_file, "--interval", str(a.interval),
+        ])
     if a.cmd == "stats":
         import requests
 

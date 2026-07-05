@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yoro-cache"
-version = "0.1.1"
+version = "0.1.2"
 description = "YORO — You Only Reason Once. A drop-in LLM caching proxy that invalidates on change and replays cached reasoning instead of serving stale answers."
 readme = "README.md"
 license = { text = "MIT" }
@@ -25,6 +25,9 @@ dependencies = [
 
 [project.optional-dependencies]
 embed = ["sentence-transformers>=3.0"]          # real semantic matching (pulls torch)
+litellm = ["litellm>=1.60"]                     # YoroSemanticCache adapter
+langchain = ["langchain-core>=0.3"]             # YoroLangChainCache adapter
+mcp = ["mcp>=1.0"]                              # yoro mcp-bridge
 dev = ["pytest>=8"]
 
 [project.scripts]
@@ -35,7 +38,7 @@ Homepage = "https://yorocache.com"
 Repository = "https://github.com/ChaitanyaPinapaka/yoro-cache"
 
 [tool.setuptools]
-packages = ["yoro", "bench"]
+packages = ["yoro", "yoro.integrations", "bench"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

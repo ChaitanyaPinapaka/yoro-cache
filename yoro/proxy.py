@@ -38,6 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
 from .cache import ReasoningCache
+from .deps import resolve_deps
 from .invalidation import Invalidator
 from .matcher import Decision, Matcher
 
@@ -102,6 +103,24 @@ def cacheable_reason(
 
 def is_cacheable(body: dict, cache_header: Optional[str], policy: str) -> bool:
     return cacheable_reason(body, cache_header, policy) is None
+
+
+REPLAY_SYSTEM = (
+    "You are given a validated procedure that solved a very similar task. Apply it "
+    "directly to the new inputs: do not re-derive, re-plan, or explore; execute the "
+    "procedure's steps on the new values and state the result. Be terse."
+)
+
+
+def replay_body(body: dict, task: str, derivation: str) -> dict:
+    """The upstream request for the replay tier: same client fields, but the messages
+    inject the cached derivation and ask for direct application to the new task."""
+    out = dict(body)
+    out["messages"] = [
+        {"role": "system", "content": REPLAY_SYSTEM},
+        {"role": "user", "content": f"Validated procedure:\n{derivation}\n\nApply it to this task:\n{task}"},
+    ]
+    return out
 
 
 def synth_message(content: str, reasoning: Optional[str] = None) -> dict:
@@ -211,10 +230,11 @@ class Stats:
     hit: int = 0
     miss: int = 0
     skip: int = 0
+    replay: int = 0
     stored: int = 0
 
     def as_dict(self) -> dict:
-        served = self.hit + self.miss + self.skip
+        served = self.hit + self.miss + self.skip + self.replay
         return {
             **self.__dict__,
             "served": served,
@@ -251,15 +271,16 @@ class ProxyCache:
             return self.embedder.embed(task)
 
     def lookup(self, task: str, deps: dict):
-        """Returns (decision, case, sim, emb). HIT means: replay case.outcome.
-        The embedding is returned so a following store() never re-encodes."""
+        """Returns (decision, case, sim, emb, fresh). The embedding is returned so a
+        following store() never re-encodes; freshness so the handler can pick the
+        replay tier on a stale same-case escalation."""
         emb = self._embed(task)
         with self._lock:
             case, sim = self.cache.nearest(emb)
             if case is None:
-                return Decision.MISS, None, -1.0, emb
+                return Decision.MISS, None, -1.0, emb, True
             fresh = self.invalidator.is_fresh(case, deps)
-            return self.matcher.decide(sim, fresh), case, sim, emb
+            return self.matcher.decide(sim, fresh), case, sim, emb, fresh
 
     def store(
         self, task: str, content: str, reasoning: Optional[str], deps: dict, emb=None
@@ -269,6 +290,19 @@ class ProxyCache:
         with self._lock:
             self.cache.add(task, emb, reasoning or content, content, deps)
             self.stats.stored += 1
+            self.cache.save()
+
+    def store_replay(self, case, task: str, content: str, deps: dict, emb=None) -> None:
+        """A replayed answer refreshes the case in place: new outcome + deps/version,
+        original derivation preserved (the terse replay output must never erode the
+        method that will be injected on the next change)."""
+        if emb is None:
+            emb = self._embed(task)
+        with self._lock:
+            keep = case.reasoning
+            c = self.cache.update(case.id, task, emb, keep, content, deps)
+            c.steps = case.steps
+            self.stats.replay += 1
             self.cache.save()
 
     def bump(self, field: str) -> None:
@@ -303,6 +337,11 @@ class Config:
     )
     port: int = field(default_factory=lambda: int(os.environ.get("YORO_PORT", "8400")))
     policy: str = field(default_factory=lambda: os.environ.get("YORO_POLICY", "safe"))
+    replay: bool = field(
+        default_factory=lambda: os.environ.get("YORO_REPLAY", "on").lower() not in ("off", "0", "false")
+    )
+    git_repo: str = field(default_factory=lambda: os.environ.get("YORO_GIT", ""))
+    deps_file: str = field(default_factory=lambda: os.environ.get("YORO_DEPS_FILE", ""))
     tau_hit: float = field(
         default_factory=lambda: float(os.environ.get("YORO_TAU_HIT", "0.95"))
     )
@@ -406,7 +445,11 @@ def make_handler(cfg: Config, pcache: ProxyCache):
             model = body.get("model", "yoro")
             stream = bool(body.get("stream"))
             cache_hdr = self.headers.get("X-YORO-Cache")
-            deps = parse_deps(self.headers.get("X-YORO-Deps"))
+            deps = resolve_deps(
+                parse_deps(self.headers.get("X-YORO-Deps")),
+                git_repo=cfg.git_repo,
+                deps_file=cfg.deps_file,
+            )
             task = extract_task(body.get("messages", []))
 
             why = cacheable_reason(body, cache_hdr, cfg.policy)
@@ -417,18 +460,41 @@ def make_handler(cfg: Config, pcache: ProxyCache):
                     body, raw, store_task=None, deps=deps, tag=f"SKIP:{why}"
                 )
 
-            decision, case, sim, emb = pcache.lookup(task, deps)
+            decision, case, sim, emb, fresh = pcache.lookup(task, deps)
             if decision == Decision.HIT and case is not None:
                 self._note("HIT", task, sim)
                 pcache.record_hit(case)
                 created = time.time()
                 hdr = {"X-YORO-Cache": "HIT", "X-YORO-Sim": f"{sim:.3f}"}
-                reasoning = case.reasoning if case.reasoning != case.outcome else None
+                # after a replay refresh (version > 1) the stored derivation belongs to the
+                # ORIGINAL inputs; echoing it beside the refreshed answer would mislead.
+                reasoning = (
+                    case.reasoning
+                    if case.version == 1 and case.reasoning != case.outcome
+                    else None
+                )
                 if stream:
                     iu = bool((body.get("stream_options") or {}).get("include_usage"))
                     return self._stream_cached(model, case.outcome, created, hdr, iu)
                 return self._send_json(
                     synth_completion(model, case.outcome, reasoning, created), 200, hdr
+                )
+
+            # stale same-case: the entry demonstrably matches (sim >= tau_hit) but its
+            # dependencies changed -> REPLAY the stored derivation against the new inputs
+            # instead of re-deriving blind.
+            if (
+                cfg.replay
+                and case is not None
+                and sim >= pcache.matcher.tau_hit
+                and not fresh
+                and (case.reasoning or "").strip()
+            ):
+                self._note("REPLAY", task, sim)
+                b2 = replay_body(body, task, case.reasoning)
+                return self._proxy_chat(
+                    b2, json.dumps(b2).encode(), store_task=task, deps=deps,
+                    tag="REPLAY", emb=emb, replay_case=case,
                 )
 
             pcache.bump("miss")
@@ -475,11 +541,12 @@ def make_handler(cfg: Config, pcache: ProxyCache):
             deps: dict,
             tag: str,
             emb=None,
+            replay_case=None,
         ):
             stream = bool(body.get("stream"))
             try:
                 if stream:
-                    return self._proxy_stream(raw, store_task, deps, tag, emb)
+                    return self._proxy_stream(raw, store_task, deps, tag, emb, replay_case)
                 r = sess.post(
                     upstream_url(self.path), headers=self._auth(), data=raw, timeout=600
                 )
@@ -488,16 +555,19 @@ def make_handler(cfg: Config, pcache: ProxyCache):
                     msg = (obj.get("choices") or [{}])[0].get("message", {})
                     content = (msg.get("content") or "").strip()
                     reasoning = (msg.get("reasoning_content") or "").strip() or None
-                    if content:
+                    if content and replay_case is not None:
+                        pcache.store_replay(replay_case, store_task, content, deps, emb=emb)
+                    elif content:
                         pcache.store(store_task, content, reasoning, deps, emb=emb)
                     else:  # e.g. a reasoning model exhausted max_tokens thinking
-                        self._note("MISS:not-stored(empty content)", store_task)
+                        self._note(f"{tag}:not-stored(empty content)", store_task)
                 return self._send_json(obj, r.status_code, {"X-YORO-Cache": tag})
             except Exception as e:
                 return self._send_json({"error": str(e)}, 502)
 
         def _proxy_stream(
-            self, raw: bytes, store_task: Optional[str], deps: dict, tag: str, emb=None
+            self, raw: bytes, store_task: Optional[str], deps: dict, tag: str, emb=None,
+            replay_case=None,
         ):
             try:
                 r = sess.post(
@@ -536,7 +606,9 @@ def make_handler(cfg: Config, pcache: ProxyCache):
                     return  # client hung up mid-stream
             if store_task and buf:
                 content, reasoning = accumulate_sse(bytes(buf))
-                if content:
+                if content and replay_case is not None:
+                    pcache.store_replay(replay_case, store_task, content, deps, emb=emb)
+                elif content:
                     pcache.store(store_task, content, reasoning, deps, emb=emb)
 
         def _note(self, tag: str, task: str, sim: float = -1.0):

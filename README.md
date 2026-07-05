@@ -3,12 +3,12 @@
 ![tests](https://github.com/ChaitanyaPinapaka/yoro-cache/actions/workflows/tests.yml/badge.svg)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-YORO is an OpenAI-compatible caching proxy for LLM applications. Unlike a plain
-semantic cache, it tracks what each cached answer depends on and invalidates
-entries when those dependencies change, so it never serves an answer whose
-premises moved. The engine can also re-apply the cached derivation to new inputs
-(*replay*) instead of re-deriving from scratch — available in the library today,
-wired into the proxy in the next release.
+YORO is an OpenAI-compatible caching proxy for LLM applications: procedural
+memory for LLM systems. Unlike a plain semantic cache, it tracks what each cached
+answer depends on and invalidates entries when those dependencies change, so it
+never serves an answer whose premises moved. And when a dependency does change,
+it does not re-derive from scratch: it *replays* the cached derivation against
+the new inputs. Remember how, invalidate when the world moves, replay.
 
 Website: [yorocache.com](https://yorocache.com)
 
@@ -73,9 +73,14 @@ provider in `opencode.json`:
 The safe policy caches OpenCode's plain question turns and passes its tool-bearing
 (agentic) turns through untouched.
 
-To scope a cache entry to workspace state, pass dependency fingerprints. An entry
-only serves while its fingerprints match what was stored; when they change, the
-entry stops serving and the request is re-reasoned upstream:
+To scope a cache entry to workspace state, pass dependency fingerprints — or let
+the proxy compute them: `yoro serve --git .` fingerprints the working tree (any
+commit or edit invalidates workspace-scoped entries), and `--deps-file deps.json`
+reads `{name: fingerprint}` maintained by any sidecar, including the MCP bridge
+(`yoro mcp-bridge --server "<cmd>" --deps-file deps.json`). An entry only serves
+while its fingerprints match; when they change, the proxy replays the stored
+derivation against the new inputs (`X-YORO-Cache: REPLAY`) instead of serving
+stale or re-deriving blind:
 
 ```python
 from openai import OpenAI
@@ -95,7 +100,7 @@ Every response reports the cache decision, and `yoro stats` (or
 |---|---|---|
 | `X-YORO-Deps` | request | `name:fingerprint,...` — entry serves only while these match |
 | `X-YORO-Cache: 0` / `1` | request | force caching off / on for this call |
-| `X-YORO-Cache` | response | `HIT`, `MISS`, or `SKIP:<reason>` |
+| `X-YORO-Cache` | response | `HIT`, `REPLAY`, `MISS`, or `SKIP:<reason>` |
 | `X-YORO-Sim` | response | similarity of the matched entry (on hits) |
 
 ### Configuration
@@ -123,12 +128,29 @@ cheapest tier that is safe:
 2. **Replay** — same entry, but its dependencies changed: inject the stored
    derivation (the model's visible working, or a structured plan where none is
    exposed) and apply it to the new inputs. Short output; no re-exploration.
-   (Library + benchmark today; proxy integration lands in the next release.)
+   Disable with `YORO_REPLAY=off`.
 3. **Reason** — novel or borderline request: full reasoning upstream; the trace,
    answer, and dependency fingerprints are cached.
 
 A novelty gate escalates look-alike-but-different requests to re-reasoning instead
 of force-fitting them into a near-match — trading some hit rate for correctness.
+
+## Integrations
+
+- **LiteLLM** — drop the engine into LiteLLM's cache slot:
+  `pip install "yoro-cache[embed,litellm]"`, then
+  `litellm.cache = Cache(); litellm.cache.cache = YoroSemanticCache(git_repo=".")`
+  (`yoro.integrations.litellm_cache`).
+- **LangChain / LangGraph** — `set_llm_cache(YoroLangChainCache(git_repo="."))`
+  (`yoro.integrations.langchain_cache`); the `llm_string` is stored as a
+  dependency so models never serve each other's entries.
+- **MCP (experimental)** — `yoro mcp-bridge` mirrors an MCP server's resources
+  into a deps-file: the ecosystem's standardized change-feed becomes the
+  invalidation signal with zero application code.
+
+Cache-slot adapters serve and invalidate but cannot call the model, so the replay
+tier applies to the proxy; in the adapters a changed dependency simply misses
+(correct, never stale).
 
 ## Evaluation
 
