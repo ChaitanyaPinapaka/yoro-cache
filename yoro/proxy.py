@@ -39,6 +39,7 @@ from typing import Optional
 
 from .cache import ReasoningCache
 from .deps import resolve_deps
+from .engine import lookup as engine_lookup
 from .invalidation import Invalidator
 from .matcher import Decision, Matcher
 
@@ -232,6 +233,7 @@ class Stats:
     skip: int = 0
     replay: int = 0
     stored: int = 0
+    hit_no_deps: int = 0  # HITs whose case had no dependency scope (semantic-only)
 
     def as_dict(self) -> dict:
         served = self.hit + self.miss + self.skip + self.replay
@@ -239,12 +241,15 @@ class Stats:
             **self.__dict__,
             "served": served,
             "hit_rate": round(self.hit / served, 3) if served else 0.0,
+            "hit_no_deps_rate": (
+                round(self.hit_no_deps / self.hit, 3) if self.hit else 0.0
+            ),
         }
 
 
 class ProxyCache:
     """Wraps the YORO cache with the proxy's lookup/store decisions. Embedder is injected
-    so tests can use a cheap one.
+    so tests can use a cheap one. Routing uses `engine.lookup` (shared with YORO.solve).
 
     Thread safety: ThreadingHTTPServer serves each request on its own thread, so the
     case store, stats, and disk writes are guarded by one lock, and the embedder by
@@ -257,11 +262,13 @@ class ProxyCache:
         cache: ReasoningCache,
         matcher: Matcher,
         invalidator: Invalidator,
+        replay: bool = True,
     ):
         self.embedder = embedder
         self.cache = cache
         self.matcher = matcher
         self.invalidator = invalidator
+        self.replay = replay
         self.stats = Stats()
         self._lock = threading.Lock()
         self._embed_lock = threading.Lock()
@@ -271,16 +278,26 @@ class ProxyCache:
             return self.embedder.embed(task)
 
     def lookup(self, task: str, deps: dict):
-        """Returns (decision, case, sim, emb, fresh). The embedding is returned so a
-        following store() never re-encodes; freshness so the handler can pick the
-        replay tier on a stale same-case escalation."""
+        """Returns (decision, case, sim, emb, fresh, should_replay).
+        Embedding is returned so a following store() never re-encodes."""
         emb = self._embed(task)
         with self._lock:
-            case, sim = self.cache.nearest(emb)
-            if case is None:
-                return Decision.MISS, None, -1.0, emb, True
-            fresh = self.invalidator.is_fresh(case, deps)
-            return self.matcher.decide(sim, fresh), case, sim, emb, fresh
+            found = engine_lookup(
+                self.cache,
+                self.matcher,
+                self.invalidator,
+                emb,
+                deps,
+                replay=self.replay,
+            )
+            return (
+                found.decision,
+                found.case,
+                found.sim,
+                emb,
+                found.fresh,
+                found.should_replay,
+            )
 
     def store(
         self, task: str, content: str, reasoning: Optional[str], deps: dict, emb=None
@@ -290,7 +307,7 @@ class ProxyCache:
         with self._lock:
             self.cache.add(task, emb, reasoning or content, content, deps)
             self.stats.stored += 1
-            self.cache.save()
+            # write-behind: ReasoningCache flushes on its own schedule; force nothing extra
 
     def store_replay(self, case, task: str, content: str, deps: dict, emb=None) -> None:
         """A replayed answer refreshes the case in place: new outcome + deps/version,
@@ -303,7 +320,6 @@ class ProxyCache:
             c = self.cache.update(case.id, task, emb, keep, content, deps)
             c.steps = case.steps
             self.stats.replay += 1
-            self.cache.save()
 
     def bump(self, field: str) -> None:
         with self._lock:
@@ -313,16 +329,49 @@ class ProxyCache:
         with self._lock:
             self.cache.record_use(case, True)
             self.stats.hit += 1
+            if not (case.deps or {}):
+                self.stats.hit_no_deps += 1
+
+    def stats_dict(self) -> dict:
+        with self._lock:
+            d = self.stats.as_dict()
+            d["evicted"] = getattr(self.cache, "_evicted", 0)
+            d["cases"] = len(self.cache)
+            return d
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.lower() not in ("off", "0", "false", "no")
+
+
+def _env_int(name: str, default: Optional[int]) -> Optional[int]:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return int(raw)
 
 
 def build_proxy_cache(cfg: "Config") -> ProxyCache:
     from .embeddings import SentenceTransformerEmbedder
 
     emb = SentenceTransformerEmbedder(cfg.embed_model)
-    cache = ReasoningCache(cfg.cache_path).load()
+    cache = ReasoningCache(
+        cfg.cache_path,
+        max_cases=cfg.cache_max,
+        flush_every=cfg.cache_flush_every,
+    ).load()
     matcher = Matcher(tau_hit=cfg.tau_hit, tau_miss=cfg.tau_miss, novelty_gate=True)
-    inval = Invalidator(use_deps=True, use_ttl=False, use_reliability=False)
-    return ProxyCache(emb, cache, matcher, inval)
+    inval = Invalidator(
+        use_deps=True,
+        use_ttl=False,
+        use_reliability=False,
+        require_signal=cfg.require_signal,
+        strict_deps=cfg.strict_deps,
+    )
+    return ProxyCache(emb, cache, matcher, inval, replay=cfg.replay)
 
 
 # ---------------------------------------------------------------- config + server
@@ -338,10 +387,30 @@ class Config:
     port: int = field(default_factory=lambda: int(os.environ.get("YORO_PORT", "8400")))
     policy: str = field(default_factory=lambda: os.environ.get("YORO_POLICY", "safe"))
     replay: bool = field(
-        default_factory=lambda: os.environ.get("YORO_REPLAY", "on").lower() not in ("off", "0", "false")
+        default_factory=lambda: _env_bool("YORO_REPLAY", True)
     )
     git_repo: str = field(default_factory=lambda: os.environ.get("YORO_GIT", ""))
     deps_file: str = field(default_factory=lambda: os.environ.get("YORO_DEPS_FILE", ""))
+    # repo | mentioned | watch | off — finer than whole-tree git when "mentioned"/"watch"
+    git_mode: str = field(
+        default_factory=lambda: os.environ.get("YORO_GIT_MODE", "repo")
+    )
+    watch_paths: list = field(
+        default_factory=lambda: [
+            p.strip()
+            for p in os.environ.get("YORO_WATCH", "").split(",")
+            if p.strip()
+        ]
+    )
+    workspace: str = field(
+        default_factory=lambda: os.environ.get("YORO_WORKSPACE", "")
+    )
+    require_signal: bool = field(
+        default_factory=lambda: _env_bool("YORO_REQUIRE_SIGNAL", True)
+    )
+    strict_deps: bool = field(
+        default_factory=lambda: _env_bool("YORO_STRICT_DEPS", False)
+    )
     tau_hit: float = field(
         default_factory=lambda: float(os.environ.get("YORO_TAU_HIT", "0.95"))
     )
@@ -355,6 +424,12 @@ class Config:
         default_factory=lambda: os.path.expanduser(
             os.environ.get("YORO_CACHE_PATH", "~/.yoro/proxy_cache.json")
         )
+    )
+    cache_max: Optional[int] = field(
+        default_factory=lambda: _env_int("YORO_CACHE_MAX", None)
+    )
+    cache_flush_every: int = field(
+        default_factory=lambda: int(os.environ.get("YORO_CACHE_FLUSH_EVERY", "1"))
     )
 
 
@@ -401,10 +476,16 @@ def make_handler(cfg: Config, pcache: ProxyCache):
         # ---- GET: stats + transparent proxy (e.g. /v1/models) ----
         def do_GET(self):
             if self.path == "/yoro/stats":
-                return self._send_json(pcache.stats.as_dict())
+                return self._send_json(pcache.stats_dict())
             if self.path in ("/health", "/yoro/health"):
                 return self._send_json(
-                    {"ok": True, "upstream": cfg.upstream, "policy": cfg.policy}
+                    {
+                        "ok": True,
+                        "upstream": cfg.upstream,
+                        "policy": cfg.policy,
+                        "git_mode": cfg.git_mode,
+                        "replay": cfg.replay,
+                    }
                 )
             try:
                 r = sess.get(
@@ -445,12 +526,19 @@ def make_handler(cfg: Config, pcache: ProxyCache):
             model = body.get("model", "yoro")
             stream = bool(body.get("stream"))
             cache_hdr = self.headers.get("X-YORO-Cache")
+            task = extract_task(body.get("messages", []))
+            # model + optional workspace always scope the entry; git_mode picks
+            # coarse repo vs per-file (mentioned/watch) fingerprints
             deps = resolve_deps(
                 parse_deps(self.headers.get("X-YORO-Deps")),
                 git_repo=cfg.git_repo,
                 deps_file=cfg.deps_file,
+                git_mode=cfg.git_mode,
+                task=task,
+                watch_paths=cfg.watch_paths,
+                model=str(model or ""),
+                workspace=cfg.workspace,
             )
-            task = extract_task(body.get("messages", []))
 
             why = cacheable_reason(body, cache_hdr, cfg.policy)
             if why is not None:
@@ -460,7 +548,7 @@ def make_handler(cfg: Config, pcache: ProxyCache):
                     body, raw, store_task=None, deps=deps, tag=f"SKIP:{why}"
                 )
 
-            decision, case, sim, emb, fresh = pcache.lookup(task, deps)
+            decision, case, sim, emb, fresh, should_replay = pcache.lookup(task, deps)
             if decision == Decision.HIT and case is not None:
                 self._note("HIT", task, sim)
                 pcache.record_hit(case)
@@ -480,16 +568,8 @@ def make_handler(cfg: Config, pcache: ProxyCache):
                     synth_completion(model, case.outcome, reasoning, created), 200, hdr
                 )
 
-            # stale same-case: the entry demonstrably matches (sim >= tau_hit) but its
-            # dependencies changed -> REPLAY the stored derivation against the new inputs
-            # instead of re-deriving blind.
-            if (
-                cfg.replay
-                and case is not None
-                and sim >= pcache.matcher.tau_hit
-                and not fresh
-                and (case.reasoning or "").strip()
-            ):
+            # engine.lookup already encodes "stale same-case + derivation" as should_replay
+            if should_replay and case is not None:
                 self._note("REPLAY", task, sim)
                 b2 = replay_body(body, task, case.reasoning)
                 return self._proxy_chat(
@@ -619,14 +699,17 @@ def make_handler(cfg: Config, pcache: ProxyCache):
     return Handler
 
 
-BUILD = "yoro-proxy 0.1.0"
+BUILD = "yoro-proxy 0.2.0"
 
 
 def main():
     cfg = Config()
     print(f"YORO proxy  ::{cfg.port}  ->  {cfg.upstream}")
     print(f"  build: {BUILD}")
-    print(f"  policy={cfg.policy}  tau_hit={cfg.tau_hit}  cache={cfg.cache_path}")
+    print(
+        f"  policy={cfg.policy}  tau_hit={cfg.tau_hit}  git_mode={cfg.git_mode}  "
+        f"cache={cfg.cache_path}"
+    )
     print("  loading embedder…", flush=True)
     pcache = build_proxy_cache(cfg)
     print(
@@ -640,6 +723,7 @@ def main():
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n  bye")
+        pcache.cache.flush()
 
 
 if __name__ == "__main__":

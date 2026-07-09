@@ -74,13 +74,29 @@ The safe policy caches OpenCode's plain question turns and passes its tool-beari
 (agentic) turns through untouched.
 
 To scope a cache entry to workspace state, pass dependency fingerprints — or let
-the proxy compute them: `yoro serve --git .` fingerprints the working tree (any
-commit or edit invalidates workspace-scoped entries), and `--deps-file deps.json`
-reads `{name: fingerprint}` maintained by any sidecar, including the MCP bridge
-(`yoro mcp-bridge --server "<cmd>" --deps-file deps.json`). An entry only serves
-while its fingerprints match; when they change, the proxy replays the stored
-derivation against the new inputs (`X-YORO-Cache: REPLAY`) instead of serving
-stale or re-deriving blind:
+the proxy compute them:
+
+```bash
+# whole working tree (coarse but correct: any edit invalidates)
+yoro serve --git .
+
+# only paths named in the task (finer — unmentioned edits do not thrash the cache)
+yoro serve --git . --git-mode mentioned
+
+# explicit path list
+yoro serve --git . --watch data/rollup.csv,config.toml
+
+# sidecar JSON (file watcher, git hook, or MCP bridge)
+yoro serve --deps-file deps.json
+yoro mcp-bridge --server "<cmd>" --deps-file deps.json
+```
+
+Entries only serve while fingerprints match. When they change, the proxy
+**replays** the stored derivation against the new inputs (`X-YORO-Cache: REPLAY`)
+instead of serving stale or re-deriving blind. The proxy also scopes every entry
+by `model` (from the request body) and optional `--workspace` / `YORO_WORKSPACE`,
+so different models never share answers. Cases stored with deps refuse to HIT
+when the request carries no signal (`YORO_REQUIRE_SIGNAL=on`, default).
 
 ```python
 from openai import OpenAI
@@ -94,7 +110,12 @@ r = client.chat.completions.create(
 ```
 
 Every response reports the cache decision, and `yoro stats` (or
-`GET /yoro/stats`) shows running totals.
+`GET /yoro/stats`) shows running totals — including `hit_no_deps` (semantic-only
+hits with no dependency scope) and `evicted` when a size cap is set.
+
+Persistence defaults to a JSON file; set `YORO_CACHE_PATH` to a `.sqlite` path
+for SQLite, `YORO_CACHE_MAX` to bound size (least-used eviction), and
+`YORO_CACHE_FLUSH_EVERY` for write-behind batching.
 
 | Header | Direction | Meaning |
 |---|---|---|
@@ -112,7 +133,15 @@ Every response reports the cache decision, and `yoro stats` (or
 | `YORO_POLICY` | `safe` | `safe` refuses to cache tool-bearing or sampled turns; `aggressive` caches them |
 | `YORO_TAU_HIT` / `YORO_TAU_MISS` | `0.95` / `0.6` | reuse-acceptance / novelty thresholds |
 | `YORO_EMBED` | `all-MiniLM-L6-v2` | sentence-transformers model for matching |
-| `YORO_CACHE_PATH` | `~/.yoro/proxy_cache.json` | persistent cache location |
+| `YORO_CACHE_PATH` | `~/.yoro/proxy_cache.json` | persistent cache (`.sqlite` / `.db` uses SQLite) |
+| `YORO_CACHE_MAX` | unset | max cases before least-used eviction |
+| `YORO_CACHE_FLUSH_EVERY` | `1` | write-behind: flush every N mutations |
+| `YORO_GIT` | unset | workspace root for automatic git/file deps |
+| `YORO_GIT_MODE` | `repo` | `repo` (whole tree), `mentioned` (paths in task), `watch`, or `off` |
+| `YORO_WATCH` | unset | comma-separated paths for `git_mode=watch` |
+| `YORO_WORKSPACE` | unset | opaque id stored as a dependency (multi-tenant) |
+| `YORO_STRICT_DEPS` | `off` | require full coverage of every stored dep key |
+| `YORO_REQUIRE_SIGNAL` | `on` | refuse HITs for scoped cases when the request has no deps |
 
 The default policy is deliberately conservative: requests that carry tools, contain
 tool history, or use `temperature > 0.2` pass through uncached, because a stale hit
@@ -134,6 +163,9 @@ cheapest tier that is safe:
 
 A novelty gate escalates look-alike-but-different requests to re-reasoning instead
 of force-fitting them into a near-match — trading some hit rate for correctness.
+
+Library and proxy share one decision path (`yoro.engine.lookup`): HIT / ESCALATE /
+REPLAY cannot drift between surfaces.
 
 ## Integrations
 
@@ -201,7 +233,8 @@ and the runbook behind these numbers) lives in [`bench/`](bench/).
   (extraction rules, rubrics, tool plans) have not yet been evaluated.
 - Replay quality depends on the invalidation signal. Without dependency
   fingerprints, YORO falls back to conservative matching and behaves like a
-  gated semantic cache.
+  gated semantic cache; scoped cases with no request signal refuse to HIT rather
+  than pretending invalidation is active.
 - Related work: Buffer of Thoughts, Metacognitive Reuse, and Analogical Prompting
   reuse reasoning templates. YORO's contribution is making reuse safe and
   accounted for: invalidation, the failure-mode taxonomy, and separate input/output
@@ -210,7 +243,7 @@ and the runbook behind these numbers) lives in [`bench/`](bench/).
 ## Repository layout
 
 ```
-yoro/      library and proxy: cache, matcher, invalidation, replay, CLI
+yoro/      library and proxy: engine, cache, matcher, invalidation, replay, deps, CLI
 bench/     the benchmark harness: rungs, sweeps, taxonomy metrics, result curves, runbook
 examples/  runnable with-and-without benchmarks for each integration surface
 tests/     library, proxy, and benchmark tests; no GPU required

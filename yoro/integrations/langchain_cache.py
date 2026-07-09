@@ -28,6 +28,7 @@ from langchain_core.load import dumps, loads
 
 from ..cache import ReasoningCache
 from ..deps import resolve_deps
+from ..engine import lookup as engine_lookup
 from ..invalidation import Invalidator
 from ..matcher import Decision, Matcher
 
@@ -37,42 +38,61 @@ class YoroLangChainCache(BaseCache):
 
     def __init__(self, embedder=None, tau_hit: float = 0.95, tau_miss: float = 0.6,
                  cache_path: Optional[str] = None,
-                 git_repo: str = "", deps_file: str = "", deps_source=None):
+                 git_repo: str = "", deps_file: str = "", deps_source=None,
+                 git_mode: str = "repo", workspace: str = "",
+                 max_cases: Optional[int] = None, flush_every: int = 1):
         if embedder is None:
             from ..embeddings import SentenceTransformerEmbedder
 
             embedder = SentenceTransformerEmbedder()
         self.embedder = embedder
-        self.store = ReasoningCache(cache_path)
+        self.store = ReasoningCache(
+            cache_path, max_cases=max_cases, flush_every=flush_every
+        )
         if cache_path:
             self.store.load()
         self.matcher = Matcher(tau_hit=tau_hit, tau_miss=tau_miss, novelty_gate=True)
-        self.invalidator = Invalidator(use_deps=True, use_ttl=False, use_reliability=False)
+        self.invalidator = Invalidator(
+            use_deps=True, use_ttl=False, use_reliability=False, require_signal=True
+        )
         self.git_repo = git_repo
         self.deps_file = deps_file
         self.deps_source = deps_source
+        self.git_mode = git_mode
+        self.workspace = workspace
         self._lock = threading.Lock()
         self.hits = 0
         self.misses = 0
 
-    def _deps(self, llm_string: str) -> dict:
+    def _deps(self, prompt: str, llm_string: str) -> dict:
         extra = self.deps_source() if callable(self.deps_source) else {}
-        deps = resolve_deps(extra or {}, git_repo=self.git_repo, deps_file=self.deps_file)
+        deps = resolve_deps(
+            extra or {},
+            git_repo=self.git_repo,
+            deps_file=self.deps_file,
+            git_mode=self.git_mode,
+            task=prompt,
+            workspace=self.workspace,
+        )
+        # llm_string remains the model+params scope (more precise than model name alone)
         deps["llm"] = hashlib.sha256(llm_string.encode()).hexdigest()[:12]
+        deps.setdefault("model", deps["llm"])
         return deps
 
     def lookup(self, prompt: str, llm_string: str) -> Optional[RETURN_VAL_TYPE]:
         emb = self.embedder.embed(prompt)
         with self._lock:
-            case, sim = self.store.nearest(emb)
-            if case is None:
-                self.misses += 1
-                return None
-            fresh = self.invalidator.is_fresh(case, self._deps(llm_string))
-            if self.matcher.decide(sim, fresh) == Decision.HIT:
+            found = engine_lookup(
+                self.store,
+                self.matcher,
+                self.invalidator,
+                emb,
+                self._deps(prompt, llm_string),
+            )
+            if found.decision == Decision.HIT and found.case is not None:
                 self.hits += 1
-                self.store.record_use(case, True)
-                return loads(case.outcome)
+                self.store.record_use(found.case, True)
+                return loads(found.case.outcome)
             self.misses += 1
             return None
 
@@ -80,8 +100,8 @@ class YoroLangChainCache(BaseCache):
         emb = self.embedder.embed(prompt)
         payload = dumps(list(return_val))
         with self._lock:
-            self.store.add(prompt, emb, payload, payload, self._deps(llm_string))
-            self.store.save()
+            self.store.add(prompt, emb, payload, payload, self._deps(prompt, llm_string))
+            self.store.flush()
 
     def clear(self, **kwargs: Any) -> None:
         with self._lock:

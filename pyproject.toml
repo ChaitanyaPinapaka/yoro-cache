@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yoro-cache"
-version = "0.1.2"
+version = "0.2.0"
 description = "YORO — You Only Reason Once. A drop-in LLM caching proxy that invalidates on change and replays cached reasoning instead of serving stale answers."
 readme = "README.md"
 license = { text = "MIT" }

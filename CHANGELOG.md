@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.2.0 — 2026-07-09
+
+Correctness and operations hardening: empty-deps no longer silently disables
+invalidation, library and proxy share one decision engine, model/workspace scope
+entries, git can fingerprint individual files, and the cache supports eviction
+plus write-behind SQLite persistence.
+
+### Strict / empty-deps invalidation
+- Cases stored *with* dependency fingerprints refuse to serve when the request
+  carries no signal (`require_signal=True`, default). Previously `{}` current deps
+  made every scoped entry look fresh.
+- Optional `strict_deps=True` (`YORO_STRICT_DEPS=1` / `--strict-deps`): every key
+  on the case must be present and matching in the request.
+- Proxy stats gain `hit_no_deps` / `hit_no_deps_rate` so semantic-only hits are visible.
+
+### Shared decision engine (`yoro/engine.py`)
+- `lookup()` is the single HIT / ESCALATE / REPLAY ladder used by `YORO.solve` and
+  `ProxyCache` (and LiteLLM / LangChain adapters). Surfaces can no longer drift.
+
+### Model + workspace scope
+- Proxy always attaches `model` (request body) and optional `workspace`
+  (`YORO_WORKSPACE` / `--workspace`) as dependency keys — different models never
+  share entries.
+- `resolve_deps(..., model=..., workspace=...)` / `scope_deps()` for library use.
+
+### Finer-grained file deps
+- `git_mode=mentioned` (`YORO_GIT_MODE=mentioned` / `--git-mode mentioned`):
+  fingerprint only path-like tokens named in the task under `--git`.
+- `git_mode=watch` + `YORO_WATCH` / `--watch a,b`: explicit path list.
+- Unmentioned file edits no longer thrash the whole cache.
+
+### Eviction + write-behind persistence
+- `ReasoningCache(max_cases=N)` drops least-used / oldest entries.
+- `flush_every=N` batches disk writes; `flush()` / `close()` force a write.
+- SQLite backend for `.sqlite` / `.db` paths (JSON remains default for `.json`).
+- Env: `YORO_CACHE_MAX`, `YORO_CACHE_FLUSH_EVERY`; CLI: `--cache-max`,
+  `--cache-flush-every`.
+
 ## 0.1.2 — 2026-07-05
 
 The replay release: the proxy now ships the full graduated serve → replay → reason

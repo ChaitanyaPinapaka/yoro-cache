@@ -115,8 +115,78 @@ def test_invalidator():
     inv = Invalidator(use_deps=True, use_ttl=False, use_reliability=False)
     assert inv.is_fresh(c, {"src": "A#1"}) is True
     assert inv.is_fresh(c, {"src": "A#2"}) is False  # premise changed -> stale
+    # case has deps but request carries no signal -> refuse (do not pretend invalidation works)
+    assert inv.is_fresh(c, {}) is False
+    assert inv.is_fresh(c, None) is False
+    inv_loose = Invalidator(
+        use_deps=True, use_ttl=False, use_reliability=False, require_signal=False
+    )
+    assert inv_loose.is_fresh(c, {}) is True  # opt-out of empty-signal guard
+    inv_strict = Invalidator(
+        use_deps=True, use_ttl=False, use_reliability=False, strict_deps=True
+    )
+    assert inv_strict.is_fresh(c, {"src": "A#1", "extra": "x"}) is True  # case keys covered
+    assert inv_strict.is_fresh(
+        ReasoningCase(
+            id="y",
+            task="t",
+            embedding=np.zeros(4, dtype=np.float32),
+            reasoning="r",
+            outcome="o",
+            deps={"src": "A#1", "other": "B#1"},
+        ),
+        {"src": "A#1"},
+    ) is False  # missing other under strict
     inv_off = Invalidator(use_deps=False, use_ttl=False, use_reliability=False)
     assert inv_off.is_fresh(c, {"src": "A#2"}) is True  # deps toggle off: drift ignored
+
+
+def test_engine_lookup_shared():
+    """Library and proxy share engine.lookup for HIT / replay routing."""
+    from yoro import lookup as engine_lookup
+
+    e = HashEmbedder(64)
+    cache = ReasoningCache()
+    emb = e.embed("famA aw0 aw1 aw2 aw3")
+    cache.add("t", emb, "method: add then triple", "42", {"src": "v1"})
+    matcher = Matcher(0.9, 0.6, True)
+    inv = Invalidator(use_deps=True, use_ttl=False, use_reliability=False)
+
+    hit = engine_lookup(cache, matcher, inv, emb, {"src": "v1"}, replay=True)
+    assert hit.decision == Decision.HIT and hit.should_replay is False
+
+    stale = engine_lookup(cache, matcher, inv, emb, {"src": "v2"}, replay=True)
+    assert stale.decision == Decision.ESCALATE and stale.same_case and stale.should_replay
+
+    empty = engine_lookup(cache, matcher, inv, emb, {}, replay=True)
+    assert empty.fresh is False and empty.decision == Decision.ESCALATE
+
+
+def test_cache_eviction_and_sqlite(tmp_path):
+    e = HashEmbedder(32)
+    c = ReasoningCache(max_cases=3)
+    for i in range(5):
+        case = c.add(f"t{i}", e.embed(f"fam tokens {i} uniq{i}"), "r", f"o{i}", {})
+        if i < 2:
+            c.record_use(case, True)
+            c.record_use(case, True)  # pin early cases via higher use count
+    assert len(c) == 3
+    assert c._evicted == 2
+    # heavily used early cases survive
+    ids = {x.outcome for x in c.cases}
+    assert "o0" in ids and "o1" in ids
+
+    p = str(tmp_path / "cache.sqlite")
+    sc = ReasoningCache(p, flush_every=10)
+    sc.add("a", e.embed("alpha beta gamma"), "r", "oa", {"k": "1"})
+    assert not os.path.exists(p)  # write-behind: not flushed yet
+    sc.add("b", e.embed("delta epsilon zeta"), "r", "ob", {"k": "1"})
+    sc.flush()
+    assert os.path.exists(p)
+    loaded = ReasoningCache(p).load()
+    assert len(loaded) == 2
+    case, sim = loaded.nearest(e.embed("alpha beta gamma"))
+    assert case.outcome == "oa" and sim > 0.9
 
 
 def test_end_to_end_reason_once_reuse_update():

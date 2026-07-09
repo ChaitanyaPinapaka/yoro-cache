@@ -667,8 +667,9 @@
                             Short output, no re-exploration. Reasoning effort
                             dials cost vs accuracy (96%@21% or 92%@10% of
                             no-cache tokens).
-                            Live in the proxy as of v0.1.2: responses carry
-                            X-YORO-Cache: REPLAY.
+                            Live in the proxy: responses carry
+                            <code>X-YORO-Cache: REPLAY</code>. Library and proxy
+                            share one decision engine (v0.2).
                         </p>
                     </div>
                     <div class="card">
@@ -695,9 +696,16 @@
                         (that's the ~0 brittleness in E2′).
                     </li>
                     <li>
+                        <strong>Honest invalidation:</strong> scoped entries
+                        refuse to HIT when the request carries no dependency
+                        signal; every entry is also scoped by
+                        <code>model</code> (and optional workspace).
+                    </li>
+                    <li>
                         <strong>Observability:</strong> every response carries
-                        <code>X-YORO-Cache: HIT|MISS|SKIP</code> +
-                        similarity; <code>/yoro/stats</code> has running totals.
+                        <code>X-YORO-Cache: HIT|REPLAY|MISS|SKIP</code> +
+                        similarity; <code>/yoro/stats</code> includes
+                        <code>hit_no_deps</code> and eviction counts.
                     </li>
                 </ul>
             </div>
@@ -750,13 +758,16 @@ YORO_UPSTREAM=http://127.0.0.1:8000/v1 yoro serve
                         <h3>Watch it work</h3>
 <pre><code>$ curl -s :8400/yoro/stats
 {
-  "hit": 42, "miss": 17, "skip": 6,
-  "stored": 17, "served": 65,
-  "hit_rate": 0.646
+  "hit": 42, "miss": 17, "skip": 6, "replay": 3,
+  "stored": 17, "served": 68, "hit_rate": 0.618,
+  "hit_no_deps": 2, "hit_no_deps_rate": 0.048,
+  "evicted": 0, "cases": 17
 }</code></pre>
                         <p style="color: var(--ink-2); font-size: 0.92rem">
                             Every response carries the decision in its headers,
                             so you can audit each reuse.
+                            <code>hit_no_deps</code> flags semantic-only hits
+                            (no dependency scope).
                         </p>
                     </div>
                 </div>
@@ -777,10 +788,17 @@ YORO_UPSTREAM=http://127.0.0.1:8000/v1 yoro serve
                             <tr><th>Variable</th><th>Default</th></tr>
                             <tr><td><code>YORO_UPSTREAM</code></td><td><code>http://127.0.0.1:8000/v1</code></td></tr>
                             <tr><td><code>YORO_PORT</code></td><td><code>8400</code></td></tr>
-                            <tr><td><code>YORO_POLICY</code></td><td><code>safe</code> (refuses agentic/sampled turns) · <code>aggressive</code></td></tr>
+                            <tr><td><code>YORO_POLICY</code></td><td><code>safe</code> · <code>aggressive</code></td></tr>
                             <tr><td><code>YORO_TAU_HIT</code> / <code>YORO_TAU_MISS</code></td><td><code>0.95</code> / <code>0.6</code></td></tr>
                             <tr><td><code>YORO_EMBED</code></td><td><code>all-MiniLM-L6-v2</code></td></tr>
-                            <tr><td><code>YORO_CACHE_PATH</code></td><td><code>~/.yoro/proxy_cache.json</code></td></tr>
+                            <tr><td><code>YORO_CACHE_PATH</code></td><td><code>~/.yoro/proxy_cache.json</code> (use <code>.sqlite</code> for SQLite)</td></tr>
+                            <tr><td><code>YORO_CACHE_MAX</code></td><td>unset — least-used eviction when set</td></tr>
+                            <tr><td><code>YORO_CACHE_FLUSH_EVERY</code></td><td><code>1</code> — write-behind batch size</td></tr>
+                            <tr><td><code>YORO_GIT</code> / <code>YORO_GIT_MODE</code></td><td>unset / <code>repo</code> · <code>mentioned</code> · <code>watch</code> · <code>off</code></td></tr>
+                            <tr><td><code>YORO_WATCH</code></td><td>comma-separated paths for <code>watch</code> mode</td></tr>
+                            <tr><td><code>YORO_WORKSPACE</code></td><td>unset — multi-tenant isolation key</td></tr>
+                            <tr><td><code>YORO_REQUIRE_SIGNAL</code></td><td><code>on</code> — scoped cases need a deps signal to HIT</td></tr>
+                            <tr><td><code>YORO_STRICT_DEPS</code></td><td><code>off</code> — require full key coverage when on</td></tr>
                         </table>
                     </div>
                 </div>
@@ -799,15 +817,24 @@ YORO_UPSTREAM=http://127.0.0.1:8000/v1 yoro serve
                     while their dependency fingerprints match; when they change,
                     the proxy replays the stored derivation against the new
                     inputs instead of serving stale. Signals can come from the
-                    request header, from <code>yoro serve --git .</code> (the
-                    working tree as one dependency — the natural signal for
-                    coding agents), from a sidecar deps-file, or from an MCP
-                    server's resources via <code>yoro mcp-bridge</code>.
-                    Adapters ship for LiteLLM and LangChain
+                    request header; from
+                    <code>yoro serve --git .</code> (whole tree),
+                    <code>--git-mode mentioned</code> (only paths named in the
+                    task), or <code>--watch a,b</code>; from a sidecar deps-file;
+                    or from an MCP server's resources via
+                    <code>yoro mcp-bridge</code>. Entries are also scoped by
+                    model (and optional workspace). Adapters ship for LiteLLM
+                    and LangChain
                     (<code>pip install "yoro-cache[litellm]"</code> /
-                    <code>[langchain]</code>): same gate, same invalidation,
-                    inside your existing stack.
+                    <code>[langchain]</code>): same shared decision engine, same
+                    invalidation, inside your existing stack.
                 </p>
+<pre style="margin-top:14px"><code># finer invalidation (v0.2) — unmentioned file edits don't thrash the cache
+YORO_UPSTREAM=http://127.0.0.1:8000/v1 yoro serve --git . --git-mode mentioned
+
+# bound + SQLite store
+YORO_CACHE_PATH=~/.yoro/proxy.sqlite YORO_CACHE_MAX=10000 \
+  YORO_UPSTREAM=http://127.0.0.1:8000/v1 yoro serve</code></pre>
             </div>
         </section>
 

@@ -43,10 +43,46 @@ def main(argv=None) -> int:
         "(any commit or edit invalidates entries scoped to it)",
     )
     sv.add_argument(
+        "--git-mode",
+        choices=("repo", "mentioned", "watch", "off"),
+        default=None,
+        help="git signal granularity: whole-repo (default), paths mentioned in the "
+        "task, explicit --watch paths, or off",
+    )
+    sv.add_argument(
+        "--watch",
+        default=None,
+        metavar="PATHS",
+        help="comma-separated paths under --git to fingerprint (implies git-mode=watch)",
+    )
+    sv.add_argument(
+        "--workspace",
+        default=None,
+        help="opaque workspace id stored as a dependency (multi-tenant isolation)",
+    )
+    sv.add_argument(
         "--deps-file",
         default=None,
         metavar="JSON",
         help="JSON file of {name: fingerprint} maintained by a sidecar (file watcher, MCP bridge)",
+    )
+    sv.add_argument(
+        "--cache-max",
+        type=int,
+        default=None,
+        help="evict least-used cases when the store exceeds this size",
+    )
+    sv.add_argument(
+        "--cache-flush-every",
+        type=int,
+        default=None,
+        help="write-behind: flush to disk every N mutations (default 1 = sync)",
+    )
+    sv.add_argument(
+        "--strict-deps",
+        action="store_true",
+        default=None,
+        help="require every stored dep key to be present and matching on lookup",
     )
 
     mb = sub.add_parser("mcp-bridge", help="mirror an MCP server's resources into a deps-file")
@@ -70,8 +106,21 @@ def main(argv=None) -> int:
             os.environ["YORO_POLICY"] = a.policy
         if a.git:
             os.environ["YORO_GIT"] = a.git
+        if a.git_mode:
+            os.environ["YORO_GIT_MODE"] = a.git_mode
+        if a.watch:
+            os.environ["YORO_WATCH"] = a.watch
+            os.environ.setdefault("YORO_GIT_MODE", "watch")
+        if a.workspace:
+            os.environ["YORO_WORKSPACE"] = a.workspace
         if a.deps_file:
             os.environ["YORO_DEPS_FILE"] = a.deps_file
+        if a.cache_max is not None:
+            os.environ["YORO_CACHE_MAX"] = str(a.cache_max)
+        if a.cache_flush_every is not None:
+            os.environ["YORO_CACHE_FLUSH_EVERY"] = str(a.cache_flush_every)
+        if a.strict_deps:
+            os.environ["YORO_STRICT_DEPS"] = "1"
         from .proxy import main as serve_main
 
         serve_main()

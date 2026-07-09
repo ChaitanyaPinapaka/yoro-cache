@@ -5,9 +5,8 @@ model in one `solve()` loop:
 
     reason ONCE on a miss  ->  reuse on a hit  ->  re-reason + UPDATE when stale
 
-This is the YOCO ("you only cache once") analogue for cognition: the expensive
-deep reasoning of a strong model is computed once and amortized over every later
-task that matches — instead of skipped (lossy) or recomputed (wasteful).
+Routing decisions live in `engine.lookup` so the library path and the proxy share
+one ladder (HIT / REPLAY / UPDATE / COLD).
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ from typing import Callable, Optional
 
 from .cache import ReasoningCache
 from .embeddings import Embedder
+from .engine import lookup as engine_lookup
 from .invalidation import Invalidator
 from .keyer import IdentityKeyer, Keyer
 from .matcher import Decision, Matcher
@@ -75,34 +75,46 @@ class YORO:
         emb = self.embedder.embed(
             self.keyer.key(task)
         )  # key on the canonical form, store the original task
-        case, sim = self.cache.nearest(emb)
-        fresh = (
-            self.invalidator.is_fresh(case, current_deps) if case is not None else True
+        found = engine_lookup(
+            self.cache,
+            self.matcher,
+            self.invalidator,
+            emb,
+            current_deps,
+            replay=self.replay,
         )
-        decision = Decision.MISS if case is None else self.matcher.decide(sim, fresh)
+        case, sim, decision, fresh = found.case, found.sim, found.decision, found.fresh
 
         # --- hot path: reuse, no model call ---
-        if decision == Decision.HIT:
+        if decision == Decision.HIT and case is not None:
             outcome = case.outcome
             ok = verify(task, outcome) if verify else True
             self.cache.record_use(case, ok)
             if ok:
                 return Result(outcome, "hit", False, case.id, sim, case.version)
-            decision = Decision.ESCALATE  # failed reuse -> fall through and re-reason
+            # failed reuse -> fall through and re-reason (do not replay: method was wrong)
+            decision = Decision.ESCALATE
+            found = type(found)(
+                decision=decision,
+                case=case,
+                sim=sim,
+                fresh=fresh,
+                same_case=found.same_case,
+                should_replay=False,
+            )
 
-        # SAME-CASE escalation: sim >= tau_hit (the case demonstrably belongs). Drives in-place UPDATE.
+        # SAME-CASE escalation: sim >= tau_hit (the case demonstrably belongs).
         same_case = (
             decision == Decision.ESCALATE
             and case is not None
-            and sim >= self.matcher.tau_hit
+            and found.same_case
         )
-        # REPLAY is only safe when the escalation is because the DEPS actually changed (not fresh) —
-        # a failed-VERIFY escalation on a FRESH case (fresh==True) means the method just produced a
-        # wrong answer, so re-running it would just repeat the failure.
         stale_same_case = same_case and not fresh
 
-        # --- replay path: apply the cached method to current inputs (short, no fresh exploration) ---
-        if self.replay and stale_same_case and (case.reasoning or case.steps):
+        # --- replay path: apply the cached method to current inputs ---
+        if self.replay and stale_same_case and case is not None and (
+            case.reasoning or case.steps
+        ):
             # inject the RAW trace rather than the extracted steps — step extraction is
             # lossy, and the raw trace replays at least as accurately in our measurements.
             _, outcome = self.model.replay(task, case.reasoning or case.steps)
@@ -123,9 +135,8 @@ class YORO:
             if rel:
                 prompt = format_behaviors(rel) + task
         reasoning, outcome = self.model.reason(prompt)
-        # Only UPDATE in place when this is clearly the *same* case (high similarity). A merely-similar
-        # task (borderline ESCALATE) gets its own new case, so near-misses can't overwrite a good case.
-        if same_case:
+        # Only UPDATE in place when this is clearly the *same* case (high similarity).
+        if same_case and case is not None:
             c = self.cache.update(case.id, task, emb, reasoning, outcome, current_deps)
             tag = "update"
         else:
@@ -145,6 +156,9 @@ class YORO:
                     self.behaviors,
                     from_case=c.id,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                # mining is best-effort; surface once so silent failures are visible
+                import warnings
+
+                warnings.warn(f"YORO: behavior extraction failed: {e}", stacklevel=2)
         return Result(outcome, tag, True, c.id, sim, c.version)

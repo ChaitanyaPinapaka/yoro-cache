@@ -20,6 +20,7 @@ from .embeddings import (
     SentenceTransformerEmbedder,
     cosine,
 )
+from .engine import Lookup, lookup
 from .invalidation import Invalidator
 from .keyer import IdentityKeyer, Keyer, ModelKeyer
 from .matcher import Decision, Matcher
@@ -39,6 +40,8 @@ __all__ = [
     "cosine",
     "YORO",
     "Result",
+    "Lookup",
+    "lookup",
     "ReasoningTreeRouter",
     "Keyer",
     "IdentityKeyer",

@@ -24,6 +24,9 @@ pip install "yoro-cache[embed]"   # plus the extra named in each example
 The full three-tier policy (serve / replay / reason) with a real git workspace as
 the dependency. The scenario is coding-agent-shaped: recurring questions about
 workspace data, then the data changes (edit + commit), then the questions recur.
+(The example uses whole-tree `--git` mode. For production coding agents that edit
+constantly, prefer `--git-mode mentioned` or `--watch` so only named files
+invalidate — see the main [README](../README.md) configuration table.)
 
 ```bash
 python examples/proxy_git_benchmark.py --upstream http://127.0.0.1:8000/v1

@@ -32,6 +32,7 @@ from litellm.caching.base_cache import BaseCache
 
 from ..cache import ReasoningCache
 from ..deps import resolve_deps
+from ..engine import lookup as engine_lookup
 from ..invalidation import Invalidator
 from ..matcher import Decision, Matcher
 
@@ -59,45 +60,64 @@ class YoroSemanticCache(BaseCache):
 
     def __init__(self, embedder=None, tau_hit: float = 0.95, tau_miss: float = 0.6,
                  cache_path: Optional[str] = None, default_ttl: int = 60,
-                 git_repo: str = "", deps_file: str = "", deps_source=None):
+                 git_repo: str = "", deps_file: str = "", deps_source=None,
+                 git_mode: str = "repo", workspace: str = "",
+                 max_cases: Optional[int] = None, flush_every: int = 1):
         super().__init__(default_ttl=default_ttl)
         self.git_repo = git_repo
         self.deps_file = deps_file
         self.deps_source = deps_source
+        self.git_mode = git_mode
+        self.workspace = workspace
         if embedder is None:
             from ..embeddings import SentenceTransformerEmbedder
 
             embedder = SentenceTransformerEmbedder()
         self.embedder = embedder
-        self.store = ReasoningCache(cache_path)
+        self.store = ReasoningCache(
+            cache_path, max_cases=max_cases, flush_every=flush_every
+        )
         if cache_path:
             self.store.load()
         self.matcher = Matcher(tau_hit=tau_hit, tau_miss=tau_miss, novelty_gate=True)
-        self.invalidator = Invalidator(use_deps=True, use_ttl=False, use_reliability=False)
+        self.invalidator = Invalidator(
+            use_deps=True, use_ttl=False, use_reliability=False, require_signal=True
+        )
         self._lock = threading.Lock()
         self.hits = 0
         self.misses = 0
 
-    def _current_deps(self) -> dict:
+    def _current_deps(self, task: str = "", model: str = "") -> dict:
         extra = self.deps_source() if callable(self.deps_source) else {}
-        return resolve_deps(extra or {}, git_repo=self.git_repo, deps_file=self.deps_file)
+        return resolve_deps(
+            extra or {},
+            git_repo=self.git_repo,
+            deps_file=self.deps_file,
+            git_mode=self.git_mode,
+            task=task,
+            model=model,
+            workspace=self.workspace,
+        )
 
     # ---- LiteLLM sync interface ----
     def get_cache(self, key, **kwargs):
         task = _task_of(kwargs)
         if not task:
             return None
+        model = str(kwargs.get("model") or "")
         emb = self.embedder.embed(task)
         with self._lock:
-            case, sim = self.store.nearest(emb)
-            if case is None:
-                self.misses += 1
-                return None
-            fresh = self.invalidator.is_fresh(case, self._current_deps())
-            if self.matcher.decide(sim, fresh) == Decision.HIT:
+            found = engine_lookup(
+                self.store,
+                self.matcher,
+                self.invalidator,
+                emb,
+                self._current_deps(task=task, model=model),
+            )
+            if found.decision == Decision.HIT and found.case is not None:
                 self.hits += 1
-                self.store.record_use(case, True)
-                return json.loads(case.outcome)
+                self.store.record_use(found.case, True)
+                return json.loads(found.case.outcome)
             self.misses += 1
             return None
 
@@ -105,12 +125,13 @@ class YoroSemanticCache(BaseCache):
         task = _task_of(kwargs)
         if not task:
             return
+        model = str(kwargs.get("model") or "")
         emb = self.embedder.embed(task)
         payload = json.dumps(value, default=str)
-        deps = {**self._current_deps(), **_deps_of(kwargs)}
+        deps = {**self._current_deps(task=task, model=model), **_deps_of(kwargs)}
         with self._lock:
             self.store.add(task, emb, payload, payload, deps)
-            self.store.save()
+            self.store.flush()
 
     # ---- async delegates (the engine is in-process and lock-guarded) ----
     async def async_get_cache(self, key, **kwargs):

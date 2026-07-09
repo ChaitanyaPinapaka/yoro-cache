@@ -71,14 +71,14 @@ def test_proxycache_hit_miss():
         Matcher(0.95, 0.6, True),
         Invalidator(use_deps=True, use_ttl=False, use_reliability=False),
     )
-    d, _, _, _, _ = pc.lookup("sum of integers 1 to 100", {})
+    d, _, _, _, _, _ = pc.lookup("sum of integers 1 to 100", {})
     assert d == Decision.MISS  # empty cache
     pc.store("sum of integers 1 to 100", "5050", None, {})
-    d, case, sim, _, fresh = pc.lookup("sum of integers 1 to 100", {})
+    d, case, sim, _, fresh, _ = pc.lookup("sum of integers 1 to 100", {})
     assert (
         d == Decision.HIT and case.outcome == "5050" and sim > 0.99
     )  # exact recurrence
-    d2, _, _, _, _ = pc.lookup("capital city of france please", {})
+    d2, _, _, _, _, _ = pc.lookup("capital city of france please", {})
     assert d2 != Decision.HIT  # unrelated -> not a hit
     assert pc.stats.stored == 1
 
@@ -94,6 +94,8 @@ def test_proxycache_dep_invalidation():
     assert pc.lookup("read config value", {"config.toml": "v1"})[0] == Decision.HIT
     # same question, but the dependency changed -> must NOT serve the stale answer
     assert pc.lookup("read config value", {"config.toml": "v2"})[0] != Decision.HIT
+    # case has deps, request has none -> refuse (require_signal)
+    assert pc.lookup("read config value", {})[0] != Decision.HIT
 
 
 def test_synth_completion():
@@ -103,12 +105,13 @@ def test_synth_completion():
     assert c["choices"][0]["message"]["reasoning_content"] == "because"
 
 
-def _mk():
+def _mk(**kw):
     return ProxyCache(
         HashEmbedder(),
         ReasoningCache(),
         Matcher(0.95, 0.6, True),
         Invalidator(use_deps=True, use_ttl=False, use_reliability=False),
+        **kw,
     )
 
 
@@ -125,7 +128,7 @@ def test_proxycache_thread_safety():
             for j in range(30):
                 key = f"task {i} {j} tok{i * 100 + j} uniq{i}-{j}"
                 pc.store(key, f"ans-{i}-{j}", None, {})
-                d, case, sim, _, _ = pc.lookup(key, {})
+                d, case, sim, _, _, _ = pc.lookup(key, {})
                 assert case is not None
         except Exception as e:  # pragma: no cover - failure path
             errs.append(e)
@@ -153,23 +156,26 @@ def test_store_reuses_lookup_embedding():
         Matcher(0.95, 0.6, True),
         Invalidator(use_deps=True, use_ttl=False, use_reliability=False),
     )
-    d, _, _, emb, _ = pc.lookup("what is six factorial", {})
+    d, _, _, emb, _, _ = pc.lookup("what is six factorial", {})
     pc.store("what is six factorial", "720", None, {}, emb=emb)
     assert CountingEmbedder.calls == 1  # one encode for lookup+store together
 
 
 def test_replay_preserves_derivation():
-    """A stale same-case surfaces fresh=False at high sim, and store_replay refreshes
+    """A stale same-case surfaces should_replay, and store_replay refreshes
     the outcome while preserving the original derivation (no method erosion)."""
-    pc = _mk()
+    pc = _mk(replay=True)
     pc.store("compute the rollup for the ledger", "3186", "step1 add; step2 triple", {"ledger": "v1"})
-    d, case, sim, emb, fresh = pc.lookup("compute the rollup for the ledger", {"ledger": "v2"})
-    assert d == Decision.ESCALATE and sim > 0.99 and fresh is False  # stale same-case
+    d, case, sim, emb, fresh, should_replay = pc.lookup(
+        "compute the rollup for the ledger", {"ledger": "v2"}
+    )
+    assert d == Decision.ESCALATE and sim > 0.99 and fresh is False
+    assert should_replay is True
     pc.store_replay(case, "compute the rollup for the ledger", "3486", {"ledger": "v2"}, emb=emb)
     assert case.outcome == "3486"
     assert case.reasoning == "step1 add; step2 triple"  # derivation preserved
     assert case.version == 2 and pc.stats.replay == 1
-    d2, _, _, _, fresh2 = pc.lookup("compute the rollup for the ledger", {"ledger": "v2"})
+    d2, _, _, _, fresh2, _ = pc.lookup("compute the rollup for the ledger", {"ledger": "v2"})
     assert d2 == Decision.HIT and fresh2 is True  # refreshed entry serves again
 
 
@@ -201,25 +207,6 @@ def test_atomic_save_roundtrip(tmp_path):
     rc2 = ReasoningCache(p).load()
     case, sim = rc2.nearest(e.embed("alpha beta"))
     assert case.outcome == "o1" and sim > 0.99
-
-
-if __name__ == "__main__":
-    tests = [
-        test_extract_task,
-        test_parse_deps,
-        test_cacheable_policy,
-        test_proxycache_hit_miss,
-        test_proxycache_dep_invalidation,
-        test_synth_completion,
-        test_proxycache_thread_safety,
-        test_store_reuses_lookup_embedding,
-        test_replay_preserves_derivation,
-        test_replay_body_shape,
-    ]
-    for fn in tests:
-        fn()
-        print("  ok ", fn.__name__)
-    print(f"\nALL {len(tests)} PROXY TESTS PASSED")
 
 
 def test_git_fingerprint_and_deps_file(tmp_path):
@@ -267,5 +254,80 @@ def test_git_fingerprint_and_deps_file(tmp_path):
     assert d == Decision.HIT
     (repo / "data.csv").write_text("v3")
     depsmod._CACHE.clear()
-    d2, _, _, _, fresh = pc.lookup("summarize the data file", depsmod.resolve_deps({}, git_repo=str(repo)))
+    d2, _, _, _, fresh, should_replay = pc.lookup(
+        "summarize the data file", depsmod.resolve_deps({}, git_repo=str(repo))
+    )
     assert d2 == Decision.ESCALATE and fresh is False  # workspace moved -> refuse stale
+
+
+def test_mentioned_file_deps(tmp_path):
+    """git_mode=mentioned fingerprints only paths named in the task."""
+    from yoro import deps as depsmod
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "src").mkdir()
+    (root / "src" / "a.py").write_text("x = 1\n")
+    (root / "src" / "b.py").write_text("y = 2\n")
+    depsmod._CACHE.clear()
+    task = "please review src/a.py for bugs"
+    deps = depsmod.resolve_deps(
+        {}, git_repo=str(root), git_mode="mentioned", task=task
+    )
+    assert "file:src/a.py" in deps
+    assert "file:src/b.py" not in deps
+    fp1 = deps["file:src/a.py"]
+    (root / "src" / "a.py").write_text("x = 99\n")
+    deps2 = depsmod.resolve_deps(
+        {}, git_repo=str(root), git_mode="mentioned", task=task
+    )
+    assert deps2["file:src/a.py"] != fp1
+    # editing an unmentioned file does not change the signal
+    (root / "src" / "b.py").write_text("y = 99\n")
+    deps3 = depsmod.resolve_deps(
+        {}, git_repo=str(root), git_mode="mentioned", task=task
+    )
+    assert deps3["file:src/a.py"] == deps2["file:src/a.py"]
+
+
+def test_model_and_workspace_scope():
+    from yoro.deps import resolve_deps, scope_deps
+
+    d = resolve_deps({}, model="ornith-35b", workspace="proj-a")
+    assert d["model"] == "ornith-35b" and d["workspace"] == "proj-a"
+    assert scope_deps({"k": "v"}, model="m") == {"k": "v", "model": "m"}
+
+    pc = _mk()
+    pc.store("what is 2+2", "4", None, {"model": "A"})
+    assert pc.lookup("what is 2+2", {"model": "A"})[0] == Decision.HIT
+    assert pc.lookup("what is 2+2", {"model": "B"})[0] != Decision.HIT
+
+
+def test_hit_no_deps_stat():
+    pc = _mk()
+    pc.store("plain fact question", "answer", None, {})
+    pc.record_hit(pc.lookup("plain fact question", {})[1])
+    assert pc.stats.hit == 1 and pc.stats.hit_no_deps == 1
+    d = pc.stats_dict()
+    assert d["hit_no_deps_rate"] == 1.0
+
+
+if __name__ == "__main__":
+    tests = [
+        test_extract_task,
+        test_parse_deps,
+        test_cacheable_policy,
+        test_proxycache_hit_miss,
+        test_proxycache_dep_invalidation,
+        test_synth_completion,
+        test_proxycache_thread_safety,
+        test_store_reuses_lookup_embedding,
+        test_replay_preserves_derivation,
+        test_replay_body_shape,
+        test_model_and_workspace_scope,
+        test_hit_no_deps_stat,
+    ]
+    for fn in tests:
+        fn()
+        print("  ok ", fn.__name__)
+    print(f"\nALL {len(tests)} PROXY TESTS PASSED")
