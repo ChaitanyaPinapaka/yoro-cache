@@ -82,3 +82,28 @@ class StructuredReasoning:
 
     def to_dict(self) -> dict:
         return {"steps": self.steps, "edges": [list(e) for e in self.edges]}
+
+
+@dataclass
+class ProcedureArtifact:
+    """Portable replay artifact; intentionally provider-neutral and serializable."""
+
+    steps: list[str] = field(default_factory=list)
+    edges: list = field(default_factory=list)
+    inputs: list[str] = field(default_factory=list)
+    outputs: list[str] = field(default_factory=list)
+    invariants: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_reasoning(cls, reasoning: str, deps: dict | None = None) -> "ProcedureArtifact":
+        sr = StructuredReasoning.parse(reasoning)
+        return cls(steps=sr.steps, edges=sr.edges,
+                   dependencies=sorted((deps or {}).keys()))
+
+    def to_dict(self) -> dict:
+        return {
+            "steps": self.steps, "edges": [list(e) for e in self.edges],
+            "inputs": self.inputs, "outputs": self.outputs,
+            "invariants": self.invariants, "dependencies": self.dependencies,
+        }

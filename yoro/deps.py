@@ -199,25 +199,47 @@ def resolve_deps(
     """
     out: dict = {}
     if deps_file:
-        out.update(file_deps(deps_file))
+        sidecar = file_deps(deps_file)
+        out.update(sidecar)
+        # Persist source health as a dependency.  If a healthy sidecar later becomes
+        # unreadable, "ok" -> "unavailable" invalidates every case that relied on it.
+        out["source:deps-file:" + os.path.abspath(deps_file)] = (
+            "ok" if sidecar or _valid_empty_deps_file(deps_file) else "unavailable"
+        )
 
     mode = (git_mode or "repo").lower()
     if git_repo and mode not in ("off", "none", "0", "false"):
+        git_values: dict = {}
         if mode == "mentioned":
             paths = mentioned_paths(task)
             if paths:
-                out.update(file_fingerprints(paths, root=git_repo))
+                git_values = file_fingerprints(paths, root=git_repo)
             # if the task names no files, fall back to coarse git so we still have a signal
             else:
-                out.update(git_fingerprint(git_repo))
+                git_values = git_fingerprint(git_repo)
         elif mode == "watch":
             paths = list(watch_paths or [])
             if paths:
-                out.update(file_fingerprints(paths, root=git_repo))
+                git_values = file_fingerprints(paths, root=git_repo)
             else:
-                out.update(git_fingerprint(git_repo))
+                git_values = git_fingerprint(git_repo)
         else:
-            out.update(git_fingerprint(git_repo))
+            git_values = git_fingerprint(git_repo)
+        out.update(git_values)
+        out["source:git:" + os.path.abspath(git_repo)] = "ok" if git_values else "unavailable"
 
     out.update(header_deps or {})
+    # Key-set coverage is itself a signal: dropping one explicitly reported dependency
+    # must invalidate even when partial-dependency compatibility is enabled.
+    out["source:request-deps"] = content_fingerprint(
+        json.dumps(sorted(str(k) for k in (header_deps or {})))
+    )
     return scope_deps(out, model=model, workspace=workspace)
+
+
+def _valid_empty_deps_file(path: str) -> bool:
+    try:
+        with open(path) as f:
+            return json.load(f) == {}
+    except Exception:
+        return False

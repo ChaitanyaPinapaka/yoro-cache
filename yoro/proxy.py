@@ -33,6 +33,7 @@ import os
 import threading
 import time
 import uuid
+import hashlib
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
@@ -42,6 +43,8 @@ from .deps import resolve_deps
 from .engine import lookup as engine_lookup
 from .invalidation import Invalidator
 from .matcher import Decision, Matcher
+from .request_identity import has_non_text_input, request_identity
+from .telemetry import Telemetry
 
 # ---------------------------------------------------------------- pure helpers
 
@@ -61,6 +64,25 @@ def extract_task(messages: list) -> str:
     return ""
 
 
+def extract_responses_task(value) -> str:
+    """Extract the latest user text from Responses API `input`."""
+    if isinstance(value, str):
+        return value.strip()
+    messages = value if isinstance(value, list) else []
+    for item in reversed(messages):
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            return " ".join(
+                str(p.get("text", "")) for p in content
+                if isinstance(p, dict) and p.get("type") in ("input_text", "text")
+            ).strip()
+    return ""
+
+
 def parse_deps(header: Optional[str]) -> dict:
     """`X-YORO-Deps: file_a.py:9f3,config.toml:1ab` -> {name: fingerprint}. A hit only
     serves if these still match what was stored, so the caller can scope a cache entry
@@ -68,6 +90,12 @@ def parse_deps(header: Optional[str]) -> dict:
     out: dict = {}
     if not header:
         return out
+    if header.lstrip().startswith("{"):
+        try:
+            value = json.loads(header)
+            return {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else {}
+        except Exception:
+            return {}
     for part in header.split(","):
         part = part.strip()
         if ":" in part:
@@ -91,6 +119,8 @@ def cacheable_reason(
     forced = cache_header == "1"
     if temp is not None and temp > 0.2 and not forced:
         return "sampled"  # caller wants variety, not a replay
+    if has_non_text_input(body) and not forced:
+        return "multimodal"
     if forced or policy == "aggressive":
         return None
     # safe policy: never cache an agentic / tool-using turn (a stale hit could break code)
@@ -155,6 +185,66 @@ def synth_completion(
             "yoro_cache": "hit",
         },
     }
+
+
+def synth_response(model: str, content: str, created: float) -> dict:
+    rid = "resp_yoro_" + uuid.uuid4().hex[:24]
+    mid = "msg_yoro_" + uuid.uuid4().hex[:24]
+    return {
+        "id": rid, "object": "response", "created_at": int(created),
+        "status": "completed", "model": model, "background": False,
+        "completed_at": int(created), "error": None, "incomplete_details": None,
+        "instructions": None, "max_output_tokens": None,
+        "output": [{"id": mid, "type": "message", "status": "completed",
+                    "role": "assistant", "content": [
+                        {"type": "output_text", "text": content, "annotations": [], "logprobs": []}
+                    ]}],
+        "parallel_tool_calls": True, "previous_response_id": None,
+        "reasoning": {"effort": None, "summary": None}, "store": False,
+        "temperature": 0.0, "text": {"format": {"type": "text"}},
+        "tool_choice": "auto", "tools": [], "top_p": 1.0,
+        "truncation": "disabled", "user": None, "metadata": {},
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    }
+
+
+def response_output_text(obj: dict) -> str:
+    parts = []
+    for item in obj.get("output", []):
+        if not isinstance(item, dict):
+            continue
+        for part in item.get("content", []):
+            if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
+                parts.append(part.get("text", ""))
+    return "".join(parts).strip()
+
+
+def response_sse(model: str, content: str, created: float) -> bytes:
+    response = synth_response(model, content, created)
+    item = response["output"][0]
+    part = item["content"][0]
+    events = [
+        ("response.created", {"type": "response.created", "response": {**response, "status": "in_progress", "output": []}}),
+        ("response.in_progress", {"type": "response.in_progress", "response": {**response, "status": "in_progress", "output": []}}),
+        ("response.output_item.added", {"type": "response.output_item.added", "output_index": 0,
+                                        "item": {**item, "status": "in_progress", "content": []}}),
+        ("response.content_part.added", {"type": "response.content_part.added", "item_id": item["id"],
+                                         "output_index": 0, "content_index": 0,
+                                         "part": {"type": "output_text", "text": "", "annotations": []}}),
+        ("response.output_text.delta", {"type": "response.output_text.delta", "item_id": item["id"],
+                                        "output_index": 0, "content_index": 0, "delta": content}),
+        ("response.output_text.done", {"type": "response.output_text.done", "item_id": item["id"],
+                                       "output_index": 0, "content_index": 0, "text": content}),
+        ("response.content_part.done", {"type": "response.content_part.done", "item_id": item["id"],
+                                        "output_index": 0, "content_index": 0, "part": part}),
+        ("response.output_item.done", {"type": "response.output_item.done", "output_index": 0, "item": item}),
+        ("response.completed", {"type": "response.completed", "response": response}),
+    ]
+    chunks = []
+    for sequence_number, (name, payload) in enumerate(events):
+        payload["sequence_number"] = sequence_number
+        chunks.append(f"event: {name}\ndata: {json.dumps(payload)}\n\n".encode())
+    return b"".join(chunks)
 
 
 def sse_chunk(model: str, content: str, created: float) -> bytes:
@@ -223,6 +313,23 @@ def accumulate_sse(raw: bytes) -> tuple:
     return "".join(content).strip(), ("".join(reasoning).strip() or None)
 
 
+def accumulate_response_sse(raw: bytes) -> tuple[str, None]:
+    content = []
+    for line in raw.split(b"\n"):
+        line = line.strip()
+        if not line.startswith(b"data:"):
+            continue
+        try:
+            obj = json.loads(line[5:].strip())
+        except Exception:
+            continue
+        if obj.get("type") == "response.output_text.delta":
+            content.append(obj.get("delta", ""))
+        elif obj.get("type") == "response.completed" and not content:
+            content.append(response_output_text(obj.get("response", {})))
+    return "".join(content).strip(), None
+
+
 # ---------------------------------------------------------------- the cache core
 
 
@@ -263,25 +370,29 @@ class ProxyCache:
         matcher: Matcher,
         invalidator: Invalidator,
         replay: bool = True,
+        telemetry: Optional[Telemetry] = None,
     ):
         self.embedder = embedder
         self.cache = cache
         self.matcher = matcher
         self.invalidator = invalidator
         self.replay = replay
+        self.telemetry = telemetry or Telemetry()
         self.stats = Stats()
         self._lock = threading.Lock()
         self._embed_lock = threading.Lock()
+        self._flights: dict[str, threading.Event] = {}
 
     def _embed(self, task: str):
         with self._embed_lock:
             return self.embedder.embed(task)
 
-    def lookup(self, task: str, deps: dict):
+    def lookup(self, task: str, deps: dict, scope: Optional[dict] = None):
         """Returns (decision, case, sim, emb, fresh, should_replay).
         Embedding is returned so a following store() never re-encodes."""
         emb = self._embed(task)
         with self._lock:
+            self.cache.refresh()
             found = engine_lookup(
                 self.cache,
                 self.matcher,
@@ -289,7 +400,10 @@ class ProxyCache:
                 emb,
                 deps,
                 replay=self.replay,
+                scope=scope,
             )
+            self.telemetry.event("yoro.lookup", decision=found.decision.value,
+                                 similarity=found.sim, fresh=found.fresh)
             return (
                 found.decision,
                 found.case,
@@ -300,16 +414,24 @@ class ProxyCache:
             )
 
     def store(
-        self, task: str, content: str, reasoning: Optional[str], deps: dict, emb=None
+        self, task: str, content: str, reasoning: Optional[str], deps: dict, emb=None,
+        scope: Optional[dict] = None,
     ) -> None:
         if emb is None:
             emb = self._embed(task)
         with self._lock:
-            self.cache.add(task, emb, reasoning or content, content, deps)
+            self.cache.add(task, emb, reasoning or content, content, deps, scope=scope)
+            c = self.cache.cases[-1]
+            from .structured import ProcedureArtifact
+            self.cache.set_artifact(
+                c, steps=ProcedureArtifact.from_reasoning(reasoning or content, deps).steps,
+                procedure=ProcedureArtifact.from_reasoning(reasoning or content, deps).to_dict(),
+            )
             self.stats.stored += 1
             # write-behind: ReasoningCache flushes on its own schedule; force nothing extra
 
-    def store_replay(self, case, task: str, content: str, deps: dict, emb=None) -> None:
+    def store_replay(self, case, task: str, content: str, deps: dict, emb=None,
+                     scope: Optional[dict] = None) -> None:
         """A replayed answer refreshes the case in place: new outcome + deps/version,
         original derivation preserved (the terse replay output must never erode the
         method that will be injected on the next change)."""
@@ -317,7 +439,7 @@ class ProxyCache:
             emb = self._embed(task)
         with self._lock:
             keep = case.reasoning
-            c = self.cache.update(case.id, task, emb, keep, content, deps)
+            c = self.cache.update(case.id, task, emb, keep, content, deps, scope=scope)
             c.steps = case.steps
             self.stats.replay += 1
 
@@ -339,6 +461,22 @@ class ProxyCache:
             d["cases"] = len(self.cache)
             return d
 
+    def begin_fill(self, key: str) -> tuple[bool, threading.Event]:
+        """Singleflight: exactly one leader fills a missing request identity."""
+        with self._lock:
+            event = self._flights.get(key)
+            if event is not None:
+                return False, event
+            event = threading.Event()
+            self._flights[key] = event
+            return True, event
+
+    def finish_fill(self, key: str) -> None:
+        with self._lock:
+            event = self._flights.pop(key, None)
+            if event:
+                event.set()
+
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -358,10 +496,16 @@ def build_proxy_cache(cfg: "Config") -> ProxyCache:
     from .embeddings import SentenceTransformerEmbedder
 
     emb = SentenceTransformerEmbedder(cfg.embed_model)
+    vector_index = None
+    if cfg.vector_index == "hnsw":
+        from .vector_index import HNSWIndex
+        vector_index = HNSWIndex()
     cache = ReasoningCache(
         cfg.cache_path,
         max_cases=cfg.cache_max,
         flush_every=cfg.cache_flush_every,
+        vector_index=vector_index,
+        refresh_interval=cfg.cache_refresh_seconds,
     ).load()
     matcher = Matcher(tau_hit=cfg.tau_hit, tau_miss=cfg.tau_miss, novelty_gate=True)
     inval = Invalidator(
@@ -431,6 +575,12 @@ class Config:
     cache_flush_every: int = field(
         default_factory=lambda: int(os.environ.get("YORO_CACHE_FLUSH_EVERY", "1"))
     )
+    vector_index: str = field(
+        default_factory=lambda: os.environ.get("YORO_VECTOR_INDEX", "numpy").lower()
+    )
+    cache_refresh_seconds: float = field(
+        default_factory=lambda: float(os.environ.get("YORO_CACHE_REFRESH_SECONDS", "1"))
+    )
 
 
 def make_handler(cfg: Config, pcache: ProxyCache):
@@ -499,15 +649,108 @@ def make_handler(cfg: Config, pcache: ProxyCache):
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length) if length else b""
-            if not self.path.endswith("/chat/completions"):
+            if not self.path.endswith(("/chat/completions", "/responses")):
                 return self._passthrough(raw)
             try:
                 body = json.loads(raw or b"{}")
             except Exception:
                 return self._passthrough(raw)
+            if self.path.endswith("/responses"):
+                return self._handle_responses(body, raw)
             return self._handle_chat(body, raw)
 
-        def _passthrough(self, raw: bytes):
+        def _handle_responses(self, body: dict, raw: bytes):
+            task = extract_responses_task(body.get("input"))
+            model = str(body.get("model") or "yoro")
+            stream = bool(body.get("stream"))
+            normalized = dict(body)
+            normalized["messages"] = (
+                [{"role": "user", "content": task}] if isinstance(body.get("input"), str)
+                else body.get("input", [])
+            )
+            why = cacheable_reason(normalized, self.headers.get("X-YORO-Cache"), cfg.policy)
+            if why is None and (
+                body.get("store", True) is not False
+                or body.get("previous_response_id")
+                or body.get("conversation")
+            ) and self.headers.get("X-YORO-Cache") != "1":
+                why = "stateful-responses"
+            if why is not None:
+                pcache.bump("skip")
+                return self._proxy_stream(raw, None, {}, f"SKIP:{why}") if stream else self._passthrough(raw, f"SKIP:{why}")
+            identity = request_identity(body, workspace=cfg.workspace, operation="responses")
+            deps = resolve_deps(
+                parse_deps(self.headers.get("X-YORO-Deps")), git_repo=cfg.git_repo,
+                deps_file=cfg.deps_file, git_mode=cfg.git_mode, task=task,
+                watch_paths=cfg.watch_paths, model=model, workspace=cfg.workspace,
+            )
+            decision, case, sim, emb, _, should_replay = pcache.lookup(
+                task, deps, scope=identity.scope
+            )
+            if decision == Decision.HIT and case is not None:
+                pcache.record_hit(case)
+                hdr = {"X-YORO-Cache": "HIT", "X-YORO-Sim": f"{sim:.3f}"}
+                if stream:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Connection", "close")
+                    for k, v in hdr.items(): self.send_header(k, v)
+                    self.end_headers()
+                    self.close_connection = True
+                    self.wfile.write(response_sse(model, case.outcome, time.time()))
+                    self.wfile.flush()
+                    return
+                return self._send_json(synth_response(model, case.outcome, time.time()), 200, hdr)
+            if should_replay and case is not None and not stream:
+                replay_request = dict(body)
+                replay_request["instructions"] = REPLAY_SYSTEM
+                replay_request["input"] = (
+                    f"Validated procedure:\n{case.reasoning}\n\nApply it to this task:\n{task}"
+                )
+                try:
+                    rr = sess.post(upstream_url(self.path), headers=self._auth(),
+                                   data=json.dumps(replay_request).encode(), timeout=600)
+                    robj = rr.json()
+                    replayed = response_output_text(robj)
+                    from .replay import validate_output
+                    if rr.status_code == 200 and validate_output(replayed, body):
+                        replay_deps = dict(deps)
+                        replay_deps.update(parse_deps(rr.headers.get("X-YORO-Deps")))
+                        pcache.store_replay(case, task, replayed, replay_deps, emb=emb,
+                                            scope=identity.scope)
+                        return self._send_json(robj, 200, {"X-YORO-Cache": "REPLAY"})
+                except Exception:
+                    pass
+            pcache.bump("miss")
+            if stream:
+                # Forward typed upstream events faithfully. A later non-streaming request
+                # can seed the same identity; buffering typed streams is the next optimization.
+                return self._proxy_stream(
+                    raw, task, deps, "MISS", emb=emb, scope=identity.scope,
+                    response_api=True,
+                )
+            fill_key = hashlib.sha256(json.dumps(
+                [task, identity.scope, deps], sort_keys=True
+            ).encode()).hexdigest()
+            leader, event = pcache.begin_fill(fill_key)
+            if not leader:
+                event.wait(timeout=600)
+                return self._handle_responses(body, raw)
+            try:
+                r = sess.post(upstream_url(self.path), headers=self._auth(), data=raw, timeout=600)
+                obj = r.json()
+                content = response_output_text(obj)
+                if r.status_code == 200 and content:
+                    store_deps = dict(deps)
+                    store_deps.update(parse_deps(r.headers.get("X-YORO-Deps")))
+                    pcache.store(task, content, None, store_deps, emb=emb, scope=identity.scope)
+                pcache.finish_fill(fill_key)
+                return self._send_json(obj, r.status_code, {"X-YORO-Cache": "MISS"})
+            except Exception as e:
+                pcache.finish_fill(fill_key)
+                return self._send_json({"error": str(e)}, 502)
+
+        def _passthrough(self, raw: bytes, tag: Optional[str] = None):
             try:
                 r = sess.post(
                     upstream_url(self.path), headers=self._auth(), data=raw, timeout=600
@@ -517,6 +760,8 @@ def make_handler(cfg: Config, pcache: ProxyCache):
                     "Content-Type", r.headers.get("Content-Type", "application/json")
                 )
                 self.send_header("Content-Length", str(len(r.content)))
+                if tag:
+                    self.send_header("X-YORO-Cache", tag)
                 self.end_headers()
                 self.wfile.write(r.content)
             except Exception as e:
@@ -527,6 +772,7 @@ def make_handler(cfg: Config, pcache: ProxyCache):
             stream = bool(body.get("stream"))
             cache_hdr = self.headers.get("X-YORO-Cache")
             task = extract_task(body.get("messages", []))
+            identity = request_identity(body, workspace=cfg.workspace)
             # model + optional workspace always scope the entry; git_mode picks
             # coarse repo vs per-file (mentioned/watch) fingerprints
             deps = resolve_deps(
@@ -548,7 +794,9 @@ def make_handler(cfg: Config, pcache: ProxyCache):
                     body, raw, store_task=None, deps=deps, tag=f"SKIP:{why}"
                 )
 
-            decision, case, sim, emb, fresh, should_replay = pcache.lookup(task, deps)
+            decision, case, sim, emb, fresh, should_replay = pcache.lookup(
+                task, deps, scope=identity.scope
+            )
             if decision == Decision.HIT and case is not None:
                 self._note("HIT", task, sim)
                 pcache.record_hit(case)
@@ -569,18 +817,30 @@ def make_handler(cfg: Config, pcache: ProxyCache):
                 )
 
             # engine.lookup already encodes "stale same-case + derivation" as should_replay
-            if should_replay and case is not None:
+            if should_replay and case is not None and not stream:
                 self._note("REPLAY", task, sim)
                 b2 = replay_body(body, task, case.reasoning)
                 return self._proxy_chat(
                     b2, json.dumps(b2).encode(), store_task=task, deps=deps,
-                    tag="REPLAY", emb=emb, replay_case=case,
+                    tag="REPLAY", emb=emb, replay_case=case, scope=identity.scope,
+                    fallback_body=body, fallback_raw=raw,
                 )
 
             pcache.bump("miss")
             self._note("MISS", task, sim)
+            fill_key = None
+            if not stream:
+                fill_key = hashlib.sha256(json.dumps(
+                    [task, identity.scope, deps], sort_keys=True
+                ).encode()).hexdigest()
+                leader, event = pcache.begin_fill(fill_key)
+                if not leader:
+                    event.wait(timeout=600)
+                    return self._handle_chat(body, raw)
             return self._proxy_chat(
-                body, raw, store_task=task, deps=deps, tag="MISS", emb=emb
+                body, raw, store_task=task, deps=deps, tag="MISS", emb=emb,
+                scope=identity.scope,
+                fill_key=fill_key,
             )
 
         # replay a cached answer as a one-shot SSE stream
@@ -622,32 +882,51 @@ def make_handler(cfg: Config, pcache: ProxyCache):
             tag: str,
             emb=None,
             replay_case=None,
+            scope=None,
+            fallback_body=None,
+            fallback_raw=None,
+            fill_key=None,
         ):
             stream = bool(body.get("stream"))
             try:
                 if stream:
-                    return self._proxy_stream(raw, store_task, deps, tag, emb, replay_case)
+                    return self._proxy_stream(raw, store_task, deps, tag, emb, replay_case, scope)
                 r = sess.post(
                     upstream_url(self.path), headers=self._auth(), data=raw, timeout=600
                 )
                 obj = r.json()
                 if store_task and r.status_code == 200:
+                    store_deps = dict(deps)
+                    store_deps.update(parse_deps(r.headers.get("X-YORO-Deps")))
                     msg = (obj.get("choices") or [{}])[0].get("message", {})
                     content = (msg.get("content") or "").strip()
                     reasoning = (msg.get("reasoning_content") or "").strip() or None
+                    if replay_case is not None:
+                        from .replay import validate_output
+                        if not validate_output(content, fallback_body):
+                            pcache.bump("miss")
+                            return self._proxy_chat(
+                                fallback_body, fallback_raw, store_task, deps, "MISS",
+                                emb=emb, scope=scope,
+                            )
                     if content and replay_case is not None:
-                        pcache.store_replay(replay_case, store_task, content, deps, emb=emb)
+                        pcache.store_replay(replay_case, store_task, content, store_deps, emb=emb, scope=scope)
                     elif content:
-                        pcache.store(store_task, content, reasoning, deps, emb=emb)
+                        pcache.store(store_task, content, reasoning, store_deps, emb=emb, scope=scope)
                     else:  # e.g. a reasoning model exhausted max_tokens thinking
                         self._note(f"{tag}:not-stored(empty content)", store_task)
-                return self._send_json(obj, r.status_code, {"X-YORO-Cache": tag})
+                result = self._send_json(obj, r.status_code, {"X-YORO-Cache": tag})
+                if fill_key:
+                    pcache.finish_fill(fill_key)
+                return result
             except Exception as e:
+                if fill_key:
+                    pcache.finish_fill(fill_key)
                 return self._send_json({"error": str(e)}, 502)
 
         def _proxy_stream(
             self, raw: bytes, store_task: Optional[str], deps: dict, tag: str, emb=None,
-            replay_case=None,
+            replay_case=None, scope=None, response_api=False,
         ):
             try:
                 r = sess.post(
@@ -660,6 +939,8 @@ def make_handler(cfg: Config, pcache: ProxyCache):
             except Exception as e:
                 return self._send_json({"error": str(e)}, 502)
             buf = bytearray()
+            store_deps = dict(deps)
+            store_deps.update(parse_deps(r.headers.get("X-YORO-Deps")))
             with r:
                 self.send_response(r.status_code)
                 self.send_header(
@@ -685,11 +966,12 @@ def make_handler(cfg: Config, pcache: ProxyCache):
                 except (BrokenPipeError, ConnectionResetError):
                     return  # client hung up mid-stream
             if store_task and buf:
-                content, reasoning = accumulate_sse(bytes(buf))
+                parser = accumulate_response_sse if response_api else accumulate_sse
+                content, reasoning = parser(bytes(buf))
                 if content and replay_case is not None:
-                    pcache.store_replay(replay_case, store_task, content, deps, emb=emb)
+                    pcache.store_replay(replay_case, store_task, content, store_deps, emb=emb, scope=scope)
                 elif content:
-                    pcache.store(store_task, content, reasoning, deps, emb=emb)
+                    pcache.store(store_task, content, reasoning, store_deps, emb=emb, scope=scope)
 
         def _note(self, tag: str, task: str, sim: float = -1.0):
             t = (task[:60] + "…") if len(task) > 60 else task

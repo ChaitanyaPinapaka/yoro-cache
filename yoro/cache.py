@@ -45,6 +45,8 @@ class ReasoningCase:
     successes: int = 0
     failures: int = 0
     steps: list = field(default_factory=list)  # structured form of `reasoning` (see structured.py)
+    scope: dict = field(default_factory=dict)  # exact request identity
+    procedure: dict = field(default_factory=dict)  # typed replay artifact
 
     def reliability(self) -> float:
         return self.successes / self.uses if self.uses else 1.0
@@ -61,6 +63,8 @@ class ReasoningCase:
         # tolerate older payloads missing optional fields
         d.setdefault("steps", [])
         d.setdefault("deps", {})
+        d.setdefault("scope", {})
+        d.setdefault("procedure", {})
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
@@ -82,19 +86,26 @@ class ReasoningCache:
         max_cases: Optional[int] = None,
         flush_every: int = 1,
         backend: Optional[str] = None,
+        vector_index=None,
+        refresh_interval: float = 0.0,
     ):
         self.cases: list[ReasoningCase] = []
         self.path = path
         self.max_cases = max_cases
         self.flush_every = max(1, int(flush_every))
         self.backend = _detect_backend(path, backend)
+        self.vector_index = vector_index
+        self.refresh_interval = max(0.0, float(refresh_interval))
+        self._last_refresh = 0.0
         self._E = None  # cached embedding matrix; rebuilt lazily after any write
         self._dirty = 0  # mutations since last successful save
         self._evicted = 0
+        self._dirty_ids: set[str] = set()
+        self._deleted_ids: set[str] = set()
 
     # ---- writes ----
     def add(
-        self, task, embedding, reasoning, outcome, deps=None, ttl=None
+        self, task, embedding, reasoning, outcome, deps=None, ttl=None, scope=None
     ) -> ReasoningCase:
         c = ReasoningCase(
             id=uuid.uuid4().hex[:12],
@@ -104,8 +115,10 @@ class ReasoningCache:
             outcome=outcome,
             deps=dict(deps or {}),
             ttl=ttl,
+            scope=dict(scope or {}),
         )
         self.cases.append(c)
+        self._dirty_ids.add(c.id)
         self._E = None
         self._mark_dirty()
         self._evict_if_needed()
@@ -113,7 +126,7 @@ class ReasoningCache:
         return c
 
     def update(
-        self, case_id, task, embedding, reasoning, outcome, deps=None
+        self, case_id, task, embedding, reasoning, outcome, deps=None, scope=None
     ) -> ReasoningCase:
         """Re-reason an existing case: bump version, refresh content + freshness,
         and reset reliability counters (it's effectively a new belief)."""
@@ -124,9 +137,12 @@ class ReasoningCache:
         c.outcome = outcome
         if deps is not None:
             c.deps = dict(deps)
+        if scope is not None:
+            c.scope = dict(scope)
         c.version += 1
         c.updated_at = time.time()
         c.uses = c.successes = c.failures = 0
+        self._dirty_ids.add(c.id)
         self._E = None
         self._mark_dirty()
         self._maybe_flush()
@@ -138,9 +154,20 @@ class ReasoningCache:
             case.successes += 1
         else:
             case.failures += 1
+        self._dirty_ids.add(case.id)
         # mark dirty so flush/close persists counters, but do not flush on the HIT
         # hot path (would rewrite the whole store on every reuse)
         self._mark_dirty()
+
+    def set_artifact(self, case: ReasoningCase, *, steps=None, procedure=None) -> None:
+        """Attach derived replay metadata and persist it like any other mutation."""
+        if steps is not None:
+            case.steps = list(steps)
+        if procedure is not None:
+            case.procedure = dict(procedure)
+        self._dirty_ids.add(case.id)
+        self._mark_dirty()
+        self._maybe_flush()
 
     def _mark_dirty(self) -> None:
         self._dirty += 1
@@ -154,7 +181,9 @@ class ReasoningCache:
                 range(len(self.cases)),
                 key=lambda j: (self.cases[j].uses, self.cases[j].updated_at),
             )
-            self.cases.pop(i)
+            removed = self.cases.pop(i)
+            self._dirty_ids.discard(removed.id)
+            self._deleted_ids.add(removed.id)
             self._evicted += 1
             self._E = None
 
@@ -163,13 +192,20 @@ class ReasoningCache:
             self.save()
 
     # ---- reads ----
-    def nearest(self, embedding) -> tuple[Optional[ReasoningCase], float]:
+    def nearest(self, embedding, scope: Optional[dict] = None) -> tuple[Optional[ReasoningCase], float]:
         if not self.cases:
             return None, -1.0
         q = np.asarray(embedding, dtype=np.float32)
+        if self.vector_index is not None:
+            return self.vector_index.search(self.cases, q, scope)
         if self._E is None or self._E.shape[0] != len(self.cases):
             self._E = np.stack([c.embedding for c in self.cases])
         sims = self._E @ q
+        if scope is not None:
+            eligible = np.asarray([c.scope == scope for c in self.cases], dtype=bool)
+            if not eligible.any():
+                return None, -1.0
+            sims = np.where(eligible, sims, -np.inf)
         i = int(np.argmax(sims))
         return self.cases[i], float(sims[i])
 
@@ -178,6 +214,23 @@ class ReasoningCache:
             if c.id == case_id:
                 return c
         raise KeyError(case_id)
+
+    def cases_for_dependency(self, name: str) -> list[ReasoningCase]:
+        """Reverse lookup used by change feeds to target affected cases only."""
+        return [c for c in self.cases if name in (c.deps or {})]
+
+    def invalidate_dependency(self, name: str) -> int:
+        """Remove cases that relied on a dependency; returns the removed count."""
+        doomed = {c.id for c in self.cases_for_dependency(name)}
+        if not doomed:
+            return 0
+        self.cases = [c for c in self.cases if c.id not in doomed]
+        self._dirty_ids.difference_update(doomed)
+        self._deleted_ids.update(doomed)
+        self._E = None
+        self._mark_dirty()
+        self._maybe_flush()
+        return len(doomed)
 
     # ---- persistence ----
     def flush(self) -> None:
@@ -195,10 +248,14 @@ class ReasoningCache:
         backend = _detect_backend(p, self.backend if path is None else None)
         os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
         if backend == "sqlite":
+            if path is not None or not os.path.exists(p):
+                self._dirty_ids.update(c.id for c in self.cases)
             self._save_sqlite(p)
         else:
             self._save_json(p)
         self._dirty = 0
+        self._dirty_ids.clear()
+        self._deleted_ids.clear()
 
     def _save_json(self, p: str) -> None:
         tmp = p + ".tmp"  # atomic: a concurrent reader/crash never sees a torn file
@@ -207,22 +264,27 @@ class ReasoningCache:
         os.replace(tmp, p)
 
     def _save_sqlite(self, p: str) -> None:
-        tmp = p + ".tmp"
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        conn = sqlite3.connect(tmp)
+        # Incremental, transactional updates: do not rewrite/rename the entire database.
+        conn = sqlite3.connect(p, timeout=30)
         try:
             conn.execute(
-                "CREATE TABLE cases (id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+                "CREATE TABLE IF NOT EXISTS cases (id TEXT PRIMARY KEY, payload TEXT NOT NULL)"
             )
-            conn.executemany(
-                "INSERT INTO cases (id, payload) VALUES (?, ?)",
-                [(c.id, json.dumps(c.to_dict())) for c in self.cases],
-            )
+            conn.execute("PRAGMA journal_mode=WAL")
+            by_id = {c.id: c for c in self.cases}
+            dirty = [by_id[i] for i in self._dirty_ids if i in by_id]
+            if dirty:
+                conn.executemany(
+                    "INSERT INTO cases (id, payload) VALUES (?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
+                    [(c.id, json.dumps(c.to_dict())) for c in dirty],
+                )
+            if self._deleted_ids:
+                conn.executemany("DELETE FROM cases WHERE id = ?",
+                                 [(i,) for i in self._deleted_ids])
             conn.commit()
         finally:
             conn.close()
-        os.replace(tmp, p)
 
     def load(self, path: Optional[str] = None) -> "ReasoningCache":
         p = path or self.path
@@ -233,8 +295,36 @@ class ReasoningCache:
             else:
                 self._load_json(p)
             self._E = None
+            if self.vector_index is not None:
+                self.vector_index.clear()
             self._dirty = 0
         return self
+
+    def refresh(self) -> None:
+        """Merge writes from other SQLite-backed worker processes into memory."""
+        if (self.backend != "sqlite" or not self.path or not os.path.exists(self.path)
+                or self.refresh_interval <= 0):
+            return
+        now = time.time()
+        if now - self._last_refresh < self.refresh_interval:
+            return
+        conn = sqlite3.connect(self.path, timeout=30)
+        try:
+            rows = conn.execute("SELECT payload FROM cases").fetchall()
+        finally:
+            conn.close()
+        external = {c.id: c for c in (
+            ReasoningCase.from_dict(json.loads(r[0])) for r in rows
+        )}
+        local = {c.id: c for c in self.cases if c.id in self._dirty_ids}
+        external.update(local)
+        for deleted in self._deleted_ids:
+            external.pop(deleted, None)
+        self.cases = list(external.values())
+        self._E = None
+        if self.vector_index is not None:
+            self.vector_index.clear()
+        self._last_refresh = now
 
     def _load_json(self, p: str) -> None:
         with open(p) as f:

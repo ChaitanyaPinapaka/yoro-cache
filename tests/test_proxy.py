@@ -12,6 +12,9 @@ from yoro.proxy import (
     is_cacheable,
     parse_deps,
     synth_completion,
+    extract_responses_task,
+    response_output_text,
+    synth_response,
 )
 
 
@@ -303,6 +306,16 @@ def test_model_and_workspace_scope():
     assert pc.lookup("what is 2+2", {"model": "B"})[0] != Decision.HIT
 
 
+def test_request_dependency_key_removal_is_a_change():
+    from yoro.deps import resolve_deps
+    a = resolve_deps({"file:a": "1", "file:b": "1"})
+    b = resolve_deps({"file:a": "1"})
+    assert a["source:request-deps"] != b["source:request-deps"]
+    pc = _mk()
+    pc.store("q", "answer", None, a)
+    assert pc.lookup("q", b)[0] != Decision.HIT
+
+
 def test_hit_no_deps_stat():
     pc = _mk()
     pc.store("plain fact question", "answer", None, {})
@@ -310,6 +323,104 @@ def test_hit_no_deps_stat():
     assert pc.stats.hit == 1 and pc.stats.hit_no_deps == 1
     d = pc.stats_dict()
     assert d["hit_no_deps_rate"] == 1.0
+
+
+def test_request_identity_scopes_answer_affecting_context():
+    from yoro import request_identity
+    a = {"model": "m", "messages": [{"role": "system", "content": "French"},
+                                       {"role": "user", "content": "hello"}]}
+    b = {"model": "m", "messages": [{"role": "system", "content": "German"},
+                                       {"role": "user", "content": "hello"}]}
+    ia, ib = request_identity(a), request_identity(b)
+    assert ia.signature != ib.signature
+    pc = _mk()
+    pc.store("hello", "bonjour", None, {}, scope=ia.scope)
+    assert pc.lookup("hello", {}, scope=ia.scope)[0] == Decision.HIT
+    assert pc.lookup("hello", {}, scope=ib.scope)[0] == Decision.MISS
+
+
+def test_multimodal_is_conservative_by_default():
+    body = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "describe"}, {"type": "image_url", "image_url": {"url": "x"}}
+    ]}]}
+    assert is_cacheable(body, None, "safe") is False
+    assert is_cacheable(body, "1", "safe") is True
+
+
+def test_singleflight():
+    pc = _mk()
+    leader, event = pc.begin_fill("k")
+    follower, same = pc.begin_fill("k")
+    assert leader and not follower and event is same and not event.is_set()
+    pc.finish_fill("k")
+    assert event.is_set()
+
+
+def test_responses_helpers():
+    inp = [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}]
+    assert extract_responses_task(inp) == "hello"
+    obj = synth_response("m", "world", 1)
+    assert response_output_text(obj) == "world" and obj["object"] == "response"
+    from yoro.proxy import accumulate_response_sse, response_sse
+    content, reasoning = accumulate_response_sse(response_sse("m", "world", 1))
+    assert content == "world" and reasoning is None
+
+
+def test_dependency_tracker_json_header():
+    from yoro import DependencyTracker
+    d = DependencyTracker()
+    d.resource("docs://policy", "v1")
+    assert parse_deps(d.header()) == dict(d)
+
+
+def test_http_chat_and_responses_end_to_end():
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import requests
+    from yoro.proxy import Config, make_handler
+
+    calls = {"chat": 0, "responses": 0}
+
+    class Upstream(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(n) or b"{}")
+            if self.path.endswith("/responses"):
+                calls["responses"] += 1
+                obj = synth_response(body.get("model", "m"), "response-answer", 1)
+            else:
+                calls["chat"] += 1
+                obj = synth_completion(body.get("model", "m"), "chat-answer", None, 1)
+            raw = json.dumps(obj).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw))); self.end_headers()
+            self.wfile.write(raw)
+
+    try:
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    except PermissionError:
+        import pytest
+        pytest.skip("sandbox forbids loopback sockets")
+    ut = threading.Thread(target=upstream.serve_forever, daemon=True); ut.start()
+    cfg = Config(upstream=f"http://127.0.0.1:{upstream.server_address[1]}/v1",
+                 cache_path="", workspace="test")
+    proxy = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(cfg, _mk()))
+    pt = threading.Thread(target=proxy.serve_forever, daemon=True); pt.start()
+    base = f"http://127.0.0.1:{proxy.server_address[1]}/v1"
+    try:
+        chat = {"model": "m", "temperature": 0,
+                "messages": [{"role": "user", "content": "q"}]}
+        assert requests.post(base + "/chat/completions", json=chat).headers["X-YORO-Cache"] == "MISS"
+        assert requests.post(base + "/chat/completions", json=chat).headers["X-YORO-Cache"] == "HIT"
+        resp = {"model": "m", "temperature": 0, "store": False, "input": "q2"}
+        assert requests.post(base + "/responses", json=resp).headers["X-YORO-Cache"] == "MISS"
+        hit = requests.post(base + "/responses", json=resp)
+        assert hit.headers["X-YORO-Cache"] == "HIT" and response_output_text(hit.json()) == "response-answer"
+        assert calls == {"chat": 1, "responses": 1}
+    finally:
+        proxy.shutdown(); upstream.shutdown(); proxy.server_close(); upstream.server_close()
 
 
 if __name__ == "__main__":

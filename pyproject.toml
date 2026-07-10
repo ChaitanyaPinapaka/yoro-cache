@@ -28,6 +28,8 @@ embed = ["sentence-transformers>=3.0"]          # real semantic matching (pulls 
 litellm = ["litellm>=1.60"]                     # YoroSemanticCache adapter
 langchain = ["langchain-core>=0.3"]             # YoroLangChainCache adapter
 mcp = ["mcp>=1.0"]                              # yoro mcp-bridge
+ann = ["hnswlib>=0.8"]                          # scoped approximate nearest-neighbor index
+otel = ["opentelemetry-api>=1.30"]              # tracing seam
 dev = ["pytest>=8"]
 
 [project.scripts]

@@ -66,9 +66,23 @@ async def run_bridge(session, deps_file: str, interval: float = 5.0, cycles: int
     import asyncio
 
     last: dict = {}
+    subscribed: set[str] = set()
     n = 0
     while cycles is None or n < cycles:
         deps = await snapshot(session)
+        # SDKs expose this as subscribe_resource when the server advertises support.
+        # Notifications make changes visible immediately to the session; polling remains
+        # the portable fallback and also catches resource-list changes.
+        subscribe = getattr(session, "subscribe_resource", None)
+        if subscribe is not None:
+            for key in deps:
+                uri = key.removeprefix("mcp:")
+                if uri not in subscribed:
+                    try:
+                        await subscribe(uri)
+                        subscribed.add(uri)
+                    except Exception:
+                        break
         if deps != last:
             write_deps_file(deps_file, deps)
             last = deps

@@ -157,7 +157,7 @@ class MockPerfect:
 
 
 def _embedder(cfg: Config):
-    if cfg.fast_embed:
+    if cfg.fast_embed or cfg.smoke:
         from yoro import HashEmbedder
         return HashEmbedder()
     from yoro import SentenceTransformerEmbedder

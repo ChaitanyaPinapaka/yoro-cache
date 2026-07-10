@@ -49,9 +49,10 @@ def lookup(
     current_deps: Optional[dict] = None,
     *,
     replay: bool = False,
+    scope: Optional[dict] = None,
 ) -> Lookup:
     """Single source of truth for cache routing decisions."""
-    case, sim = cache.nearest(emb)
+    case, sim = cache.nearest(emb, scope=scope)
     if case is None:
         return Lookup(
             decision=Decision.MISS,

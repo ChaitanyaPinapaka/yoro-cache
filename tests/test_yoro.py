@@ -189,6 +189,34 @@ def test_cache_eviction_and_sqlite(tmp_path):
     assert case.outcome == "oa" and sim > 0.9
 
 
+def test_dependency_reverse_index():
+    c = ReasoningCache()
+    e = HashEmbedder()
+    c.add("a", e.embed("a"), "r", "o", {"file:a": "1"})
+    c.add("b", e.embed("b"), "r", "o", {"file:b": "1"})
+    assert len(c.cases_for_dependency("file:a")) == 1
+    assert c.invalidate_dependency("file:a") == 1 and len(c) == 1
+
+
+def test_replay_verification_falls_back_to_reasoning():
+    class M:
+        def __init__(self): self.reason_calls = self.replay_calls = 0
+        def reason(self, task):
+            self.reason_calls += 1
+            return "1. recompute safely", "good"
+        def replay(self, task, plan):
+            self.replay_calls += 1
+            return "", "bad"
+    m, e, c = M(), HashEmbedder(), ReasoningCache()
+    c.add("same task", e.embed("same task"), "1. old method", "old", {"x": "1"})
+    y = YORO(m, e, c, Matcher(.9, .6),
+             Invalidator(use_ttl=False, use_reliability=False), replay=True,
+             replay_verifier=lambda task, output: output == "good")
+    r = y.solve("same task", {"x": "2"})
+    assert r.outcome == "good" and r.decision == "update"
+    assert m.replay_calls == 1 and m.reason_calls == 1
+
+
 def test_end_to_end_reason_once_reuse_update():
     world = World()
     world.register("famA")

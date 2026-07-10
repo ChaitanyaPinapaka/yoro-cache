@@ -384,11 +384,11 @@ def test_hard_separability():
     and get it wrong for surface reasons, cratering the sweep. And cross-entity must stay BELOW τ (no false
     hits). Enforces min(same ref↔cold) > 0.80 and max(cross-entity) < 0.80, so it's checked not lucky.
     Skips only if sentence-transformers is absent (the real-MiniLM geometry is what matters)."""
-    try:
-        from yoro import SentenceTransformerEmbedder
-    except ImportError:
+    import importlib.util
+    if importlib.util.find_spec("sentence_transformers") is None:
         print("ok hard_separability (skipped: no sentence-transformers)")
         return
+    from yoro import SentenceTransformerEmbedder
     from bench.datasets import build_stress_workload
     import itertools
     HARD_TAU = 0.80

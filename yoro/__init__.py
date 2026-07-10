@@ -24,7 +24,11 @@ from .engine import Lookup, lookup
 from .invalidation import Invalidator
 from .keyer import IdentityKeyer, Keyer, ModelKeyer
 from .matcher import Decision, Matcher
-from .structured import StructuredReasoning, to_steps
+from .structured import ProcedureArtifact, StructuredReasoning, to_steps
+from .request_identity import RequestIdentity, request_identity
+from .telemetry import OpenTelemetry, Telemetry
+from .dependency_tracker import DependencyTracker
+from .vector_index import HNSWIndex
 from .tree import ReasoningTreeRouter
 
 __all__ = [
@@ -52,4 +56,11 @@ __all__ = [
     "format_behaviors",
     "to_steps",
     "StructuredReasoning",
+    "RequestIdentity",
+    "request_identity",
+    "ProcedureArtifact",
+    "Telemetry",
+    "OpenTelemetry",
+    "DependencyTracker",
+    "HNSWIndex",
 ]

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Exact request identities scope matches by instructions, prior context, output
+  contract, model settings, workspace, and operation; multimodal inputs skip by default.
+- Dependency source-health markers fail closed, upstream responses can report actual
+  dependencies, MCP resources subscribe where supported, and reverse invalidation is targeted.
+- Cases store typed procedure artifacts; replay adds applicability and verification
+  gates with full-reason fallback and structural JSON validation.
+- SQLite writes are incremental, cross-process changes refresh into workers, identical
+  misses coalesce, scoped HNSW is optional, and an OpenTelemetry seam records routing.
+- `/v1/responses` supports typed non-streaming and streaming cache paths.
+- Smoke benchmarks use the dependency-free hash embedder as documented.
+
 ## 0.2.0 — 2026-07-09
 
 Correctness and operations hardening: empty-deps no longer silently disables

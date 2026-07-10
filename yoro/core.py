@@ -45,6 +45,7 @@ class YORO:
         keyer: Keyer | None = None,
         behaviors=None,
         replay: bool = False,
+        replay_verifier: Optional[Callable[[str, str], bool]] = None,
     ):
         self.model = model
         self.embedder = embedder
@@ -60,6 +61,7 @@ class YORO:
         # freshness failed): a confident replayed-but-wrong answer on a genuinely
         # different task is a worse failure than an escalation.
         self.replay = replay
+        self.replay_verifier = replay_verifier
 
     def solve(
         self,
@@ -117,14 +119,23 @@ class YORO:
         ):
             # inject the RAW trace rather than the extracted steps — step extraction is
             # lossy, and the raw trace replays at least as accurately in our measurements.
-            _, outcome = self.model.replay(task, case.reasoning or case.steps)
-            # preserve the ORIGINAL trace/steps — the terse replay output would erode the
-            # very method injected on the next change. Only outcome + deps/version move.
-            c = self.cache.update(
-                case.id, task, emb, case.reasoning, outcome, current_deps
-            )
-            c.steps = case.steps
-            return Result(outcome, "replay", True, c.id, sim, c.version, replayed=True)
+            from .replay import procedure_applicable, validate_output
+
+            if not procedure_applicable(case, task):
+                found.should_replay = False
+            else:
+                _, outcome = self.model.replay(task, case.reasoning or case.steps)
+                validator = self.replay_verifier or verify
+                valid = validate_output(
+                    outcome, verifier=(lambda x: validator(task, x)) if validator else None
+                )
+                if valid:
+                    c = self.cache.update(
+                        case.id, task, emb, case.reasoning, outcome, current_deps
+                    )
+                    c.steps = case.steps
+                    c.procedure = dict(case.procedure or {})
+                    return Result(outcome, "replay", True, c.id, sim, c.version, replayed=True)
 
         # --- cold path: reason ONCE (miss / escalate / failed-hit) ---
         prompt = task
@@ -144,7 +155,11 @@ class YORO:
             tag = "cold"
         from .structured import to_steps  # store structured steps
 
-        c.steps = to_steps(reasoning)
+        from .structured import ProcedureArtifact
+        self.cache.set_artifact(
+            c, steps=to_steps(reasoning),
+            procedure=ProcedureArtifact.from_reasoning(reasoning, current_deps).to_dict(),
+        )
         if self.behaviors is not None:  # mine new behaviors
             from .behaviors import extract_behaviors
 

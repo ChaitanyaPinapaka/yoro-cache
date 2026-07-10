@@ -117,9 +117,15 @@ Persistence defaults to a JSON file; set `YORO_CACHE_PATH` to a `.sqlite` path
 for SQLite, `YORO_CACHE_MAX` to bound size (least-used eviction), and
 `YORO_CACHE_FLUSH_EVERY` for write-behind batching.
 
+YORO separates the semantic task key from an exact request identity. System and
+developer instructions, prior context, output schemas, model settings, and non-text
+parts are fingerprinted into an exact scope. The same question under different
+instructions therefore creates a separate case instead of replaying across contexts.
+Multimodal requests bypass the cache by default unless explicitly forced.
+
 | Header | Direction | Meaning |
 |---|---|---|
-| `X-YORO-Deps` | request | `name:fingerprint,...` — entry serves only while these match |
+| `X-YORO-Deps` | request or upstream response | JSON `{name:fingerprint}` or legacy `name:fingerprint,...`; entry serves only while these match |
 | `X-YORO-Cache: 0` / `1` | request | force caching off / on for this call |
 | `X-YORO-Cache` | response | `HIT`, `REPLAY`, `MISS`, or `SKIP:<reason>` |
 | `X-YORO-Sim` | response | similarity of the matched entry (on hits) |
@@ -136,6 +142,8 @@ for SQLite, `YORO_CACHE_MAX` to bound size (least-used eviction), and
 | `YORO_CACHE_PATH` | `~/.yoro/proxy_cache.json` | persistent cache (`.sqlite` / `.db` uses SQLite) |
 | `YORO_CACHE_MAX` | unset | max cases before least-used eviction |
 | `YORO_CACHE_FLUSH_EVERY` | `1` | write-behind: flush every N mutations |
+| `YORO_VECTOR_INDEX` | `numpy` | `numpy` brute-force or scoped `hnsw` (`pip install yoro-cache[ann]`) |
+| `YORO_CACHE_REFRESH_SECONDS` | `1` | SQLite cross-process visibility interval; `0` disables refresh |
 | `YORO_GIT` | unset | workspace root for automatic git/file deps |
 | `YORO_GIT_MODE` | `repo` | `repo` (whole tree), `mentioned` (paths in task), `watch`, or `off` |
 | `YORO_WATCH` | unset | comma-separated paths for `git_mode=watch` |
@@ -166,6 +174,29 @@ of force-fitting them into a near-match — trading some hit rate for correctnes
 
 Library and proxy share one decision path (`yoro.engine.lookup`): HIT / ESCALATE /
 REPLAY cannot drift between surfaces.
+
+The proxy supports both `/v1/chat/completions` and `/v1/responses`. Responses inputs
+use typed request identity and cached responses reconstruct typed output and SSE
+events. Streaming misses are forwarded byte-for-byte and stored after completion.
+Because cached synthetic response IDs are not upstream conversation objects, the safe
+policy caches only stateless Responses requests (`store: false`, without
+`previous_response_id` or `conversation`); stateful requests pass through unchanged.
+
+Applications can report the data actually read without exposing its contents:
+
+```python
+from yoro import DependencyTracker
+
+deps = DependencyTracker()
+deps.file("config.toml")
+deps.resource("docs://policy", policy_text)
+deps.query("postgres", sql, rows)
+response_headers = {"X-YORO-Deps": deps.header()}
+```
+
+The proxy merges an upstream `X-YORO-Deps` response header into the stored case.
+Configured Git and sidecar sources also store health markers, so a source becoming
+unreadable invalidates prior cases instead of silently losing coverage.
 
 ## Integrations
 
